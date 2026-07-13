@@ -47,6 +47,12 @@ set(SIMA_LMM_PLATFORM_DEP_PACKAGE_MIN_VERSION
     "${SIMA_LMM_PLATFORM_VERSION_MAJOR}.${SIMA_LMM_PLATFORM_VERSION_MINOR}.${SIMA_LMM_PREVIOUS_PLATFORM_PATCH}~")
 set(SIMA_LMM_PLATFORM_DEP_PACKAGE_MAX_VERSION
     "${SIMA_LMM_PLATFORM_VERSION_MAJOR}.${SIMA_LMM_PLATFORM_VERSION_MINOR}.${SIMA_LMM_NEXT_PLATFORM_PATCH}")
+# The 2.1.1 SiMa memory ABI remains compatible across the supported 2.1.x
+# platform range. Keep its dependency floor independent from the generic
+# platform package floor so a 2.1.3 LLiMa package remains installable on the
+# available SDK/DevKit memory package.
+set(SIMA_LMM_SIMAAI_MEMORY_PACKAGE_MIN_VERSION
+    "${SIMA_LMM_PLATFORM_VERSION_MAJOR}.${SIMA_LMM_PLATFORM_VERSION_MINOR}.1~")
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
@@ -589,7 +595,7 @@ set(CPACK_DEBIAN_CLI_PACKAGE_NAME "sima-lmm-cli")
 string(CONCAT CPACK_DEBIAN_CORE_PACKAGE_DEPENDS
     "neat-runtime (>= ${SIMA_LMM_INTERNALS_PACKAGE_MIN_VERSION}), "
     "neat-runtime (<< ${SIMA_LMM_INTERNALS_PACKAGE_MAX_VERSION}), "
-    "simaai-memory-lib (>= ${SIMA_LMM_PLATFORM_DEP_PACKAGE_MIN_VERSION}), "
+    "simaai-memory-lib (>= ${SIMA_LMM_SIMAAI_MEMORY_PACKAGE_MIN_VERSION}), "
     "simaai-memory-lib (<< ${SIMA_LMM_PLATFORM_DEP_PACKAGE_MAX_VERSION}), "
     "libcpp-httplib0.11, libfftw3-double3, "
     "libopencv-core406, libopencv-imgproc406, libopencv-imgcodecs406, "
