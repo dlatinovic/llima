@@ -68,11 +68,29 @@ def _is_draft_vlm(sima_files_dir: Path) -> bool:
     return bool(spec_cfg and spec_cfg.get("is_draft", False))
 
 
+def _is_spec_decode_vlm(devkit_dir: Path) -> bool:
+    """Return whether a devkit directory belongs to a speculative-decoding pair."""
+    config_file = devkit_dir / "vlm_config.json"
+    if not config_file.is_file():
+        return False
+    with config_file.open() as f:
+        cfg = json.load(f)
+    return bool(cfg.get("lm_cfg", {}).get("speculative_decoding_cfg"))
+
+
 def _resolve_target_and_draft_paths(model_path: Path) -> tuple[Path, Path | None]:
     """Resolve a normal model path or a speculative-decoding parent directory."""
-    if (model_path / "devkit").is_dir() and (model_path / "elf_files").is_dir():
+    if _is_spec_decode_vlm(devkit := model_path / "devkit") or _is_spec_decode_vlm(
+        sima_devkit := model_path / "sima_files" / "devkit"
+    ):
+        raise RuntimeError(
+            f"{model_path} is part of a speculative-decoding pair. "
+            f"Pass the parent directory ({model_path.parent}) so both the "
+            f"target and draft models are loaded together."
+        )
+    if devkit.is_dir() and (model_path / "elf_files").is_dir():
         return model_path, None
-    if (model_path / "sima_files" / "devkit").is_dir():
+    if sima_devkit.is_dir():
         return model_path / "sima_files", None
 
     target: Path | None = None
@@ -176,7 +194,6 @@ def run_model(args: argparse.Namespace) -> int:
                 draft_model_path,
                 system_prompt,
                 chat_template,
-                args.parallel_load,
             )
         else:
             demo = WEB(
@@ -185,7 +202,6 @@ def run_model(args: argparse.Namespace) -> int:
                 draft_model_path,
                 system_prompt,
                 chat_template,
-                args.parallel_load,
             )
     except Exception:
         msg = "Failed to create VLM or STT model"
@@ -257,12 +273,13 @@ def rm_model(args: argparse.Namespace) -> int:
 
 
 def benchmark_model(args: argparse.Namespace) -> int:
-    model_path = _resolve_run_model_path(args.model)
+    user_model_path = _resolve_run_model_path(args.model)
+    model_path, draft_model_path = _resolve_target_and_draft_paths(user_model_path)
     connect(logging.INFO)
 
     # Create a ZMQServer.
     try:
-        server = ZMQServer(model_path, args.port)
+        server = ZMQServer(model_path, args.port, draft_model_path)
     except Exception:
         msg = "Failed to create server"
         print(msg, flush=True)
@@ -317,13 +334,6 @@ def _add_run_parser(subparsers: argparse._SubParsersAction) -> None:
         type=Path,
         default=None,
         help="Path to the file with chat template.",
-    )
-    run_parser.add_argument(
-        "--parallel_load",
-        type=bool,
-        default=True,
-        action=argparse.BooleanOptionalAction,
-        help="Load multiple models in parallel.",
     )
     run_parser.add_argument("--log_level", type=str, default=None, help="Logging level")
     run_parser.set_defaults(func=run_model)

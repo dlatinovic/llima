@@ -4,22 +4,23 @@ if(NOT DEFINED SKBUILD_PROJECT_NAME)
     set(SKBUILD_PROJECT_NAME sima_lmm)
 endif()
 
-set(SIMA_LMM_PLATFORM_VERSION "")
 set(SIMA_LMM_PACKAGE_BASE_VERSION "")
+set(SIMA_LMM_PLATFORM_VERSION "")
 execute_process(
-    COMMAND python3 -c "import json; data=json.load(open('deps/manifest.json', encoding='utf-8')); print(data['platform-version']); print(data['package-version'])"
+    COMMAND python3 -c "import json; data=json.load(open('deps/manifest.json', encoding='utf-8')); print(data['package-version']); print(data['platform-version'])"
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    RESULT_VARIABLE PLATFORM_VERSION_RESULT
+    RESULT_VARIABLE MANIFEST_VERSION_RESULT
     OUTPUT_VARIABLE SIMA_LMM_MANIFEST_VERSIONS
     ERROR_QUIET
     OUTPUT_STRIP_TRAILING_WHITESPACE
 )
-if(NOT PLATFORM_VERSION_RESULT EQUAL 0 OR SIMA_LMM_MANIFEST_VERSIONS STREQUAL "")
-    message(FATAL_ERROR "Failed to read package-version and platform-version from deps/manifest.json")
+if(NOT MANIFEST_VERSION_RESULT EQUAL 0 OR SIMA_LMM_MANIFEST_VERSIONS STREQUAL "")
+    message(FATAL_ERROR
+        "Failed to read package-version and platform-version from deps/manifest.json")
 endif()
 string(REPLACE "\n" ";" SIMA_LMM_MANIFEST_VERSION_LIST "${SIMA_LMM_MANIFEST_VERSIONS}")
-list(GET SIMA_LMM_MANIFEST_VERSION_LIST 0 SIMA_LMM_PLATFORM_VERSION)
-list(GET SIMA_LMM_MANIFEST_VERSION_LIST 1 SIMA_LMM_PACKAGE_BASE_VERSION)
+list(GET SIMA_LMM_MANIFEST_VERSION_LIST 0 SIMA_LMM_PACKAGE_BASE_VERSION)
+list(GET SIMA_LMM_MANIFEST_VERSION_LIST 1 SIMA_LMM_PLATFORM_VERSION)
 
 if(NOT DEFINED SKBUILD_PROJECT_VERSION)
     set(SKBUILD_PROJECT_VERSION "${SIMA_LMM_PACKAGE_BASE_VERSION}")
@@ -33,26 +34,13 @@ list(GET SIMA_LMM_PACKAGE_BASE_VERSION_PARTS 1 SIMA_LMM_PACKAGE_BASE_VERSION_MIN
 math(EXPR SIMA_LMM_NEXT_PACKAGE_MINOR "${SIMA_LMM_PACKAGE_BASE_VERSION_MINOR} + 1")
 set(SIMA_LMM_INTERNALS_PACKAGE_MIN_VERSION "${SIMA_LMM_PACKAGE_BASE_VERSION}")
 set(SIMA_LMM_INTERNALS_PACKAGE_MAX_VERSION "${SIMA_LMM_PACKAGE_BASE_VERSION_MAJOR}.${SIMA_LMM_NEXT_PACKAGE_MINOR}.0")
-string(REPLACE "." ";" SIMA_LMM_PLATFORM_VERSION_PARTS "${SIMA_LMM_PLATFORM_VERSION}")
-list(GET SIMA_LMM_PLATFORM_VERSION_PARTS 0 SIMA_LMM_PLATFORM_VERSION_MAJOR)
-list(GET SIMA_LMM_PLATFORM_VERSION_PARTS 1 SIMA_LMM_PLATFORM_VERSION_MINOR)
-list(GET SIMA_LMM_PLATFORM_VERSION_PARTS 2 SIMA_LMM_PLATFORM_VERSION_PATCH)
-if(SIMA_LMM_PLATFORM_VERSION_PATCH GREATER 0)
-    math(EXPR SIMA_LMM_PREVIOUS_PLATFORM_PATCH "${SIMA_LMM_PLATFORM_VERSION_PATCH} - 1")
-else()
-    set(SIMA_LMM_PREVIOUS_PLATFORM_PATCH "${SIMA_LMM_PLATFORM_VERSION_PATCH}")
+set(SIMA_LMM_MEMORY_LIB_VERSION "" CACHE STRING
+    "Exact Debian version of the simaai-memory-lib package supplied by the resolved Internals artifact.")
+set(SIMA_LMM_MEMORY_LIB_DEPENDENCY "")
+if(NOT SIMA_LMM_MEMORY_LIB_VERSION STREQUAL "")
+    set(SIMA_LMM_MEMORY_LIB_DEPENDENCY
+        "simaai-memory-lib (= ${SIMA_LMM_MEMORY_LIB_VERSION}), ")
 endif()
-math(EXPR SIMA_LMM_NEXT_PLATFORM_PATCH "${SIMA_LMM_PLATFORM_VERSION_PATCH} + 1")
-set(SIMA_LMM_PLATFORM_DEP_PACKAGE_MIN_VERSION
-    "${SIMA_LMM_PLATFORM_VERSION_MAJOR}.${SIMA_LMM_PLATFORM_VERSION_MINOR}.${SIMA_LMM_PREVIOUS_PLATFORM_PATCH}~")
-set(SIMA_LMM_PLATFORM_DEP_PACKAGE_MAX_VERSION
-    "${SIMA_LMM_PLATFORM_VERSION_MAJOR}.${SIMA_LMM_PLATFORM_VERSION_MINOR}.${SIMA_LMM_NEXT_PLATFORM_PATCH}")
-# The 2.1.1 SiMa memory ABI remains compatible across the supported 2.1.x
-# platform range. Keep its dependency floor independent from the generic
-# platform package floor so a 2.1.3 LLiMa package remains installable on the
-# available SDK/DevKit memory package.
-set(SIMA_LMM_SIMAAI_MEMORY_PACKAGE_MIN_VERSION
-    "${SIMA_LMM_PLATFORM_VERSION_MAJOR}.${SIMA_LMM_PLATFORM_VERSION_MINOR}.1~")
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
@@ -61,12 +49,13 @@ include(CMakePackageConfigHelpers)
 set(TARGET_BIND cpp_ext)
 set(TARGET_RUNTIME sima_lmm_runtime)
 option(SIMA_LMM_BUILD_PYTHON "Build the Python nanobind extension." ON)
+option(SIMA_LMM_BUILD_TESTS "Build DevKit runtime test targets." OFF)
 set(SYSROOT "" CACHE PATH "Optional target sysroot prefix")
 set(
     SIMA_LMM_PYTHON_EXTENSION_INSTALL_DIR
     "devkit"
     CACHE STRING
-    "Install destination for the cpp_ext Python extension. Wheels install relative to sima_lmm."
+    "Install destination for the cpp_ext Python extension."
 )
 option(SIMA_LMM_INSTALL_PYTHON_PACKAGE "Install the lean sima_lmm Python runtime package." OFF)
 set(
@@ -456,6 +445,7 @@ set(SIMA_LMM_PUBLIC_HEADERS
     sima_lmm/devkit/cpp/setup.hpp
     sima_lmm/devkit/cpp/text_streamer.hpp
     sima_lmm/devkit/cpp/tokenizer.hpp
+    sima_lmm/devkit/cpp/tool_call_parser.hpp
     sima_lmm/devkit/cpp/utils.hpp
     sima_lmm/devkit/cpp/vision_language_model.hpp
     sima_lmm/devkit/cpp/vision_model.hpp
@@ -523,6 +513,11 @@ install(
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/SimaLMM
     COMPONENT dev
 )
+
+if(SIMA_LMM_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests/runtime)
+endif()
 
 if(SIMA_LMM_INSTALL_PYTHON_PACKAGE)
     file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/sima_lmm_VERSION"
@@ -595,8 +590,7 @@ set(CPACK_DEBIAN_CLI_PACKAGE_NAME "sima-lmm-cli")
 string(CONCAT CPACK_DEBIAN_CORE_PACKAGE_DEPENDS
     "neat-runtime (>= ${SIMA_LMM_INTERNALS_PACKAGE_MIN_VERSION}), "
     "neat-runtime (<< ${SIMA_LMM_INTERNALS_PACKAGE_MAX_VERSION}), "
-    "simaai-memory-lib (>= ${SIMA_LMM_SIMAAI_MEMORY_PACKAGE_MIN_VERSION}), "
-    "simaai-memory-lib (<< ${SIMA_LMM_PLATFORM_DEP_PACKAGE_MAX_VERSION}), "
+    "${SIMA_LMM_MEMORY_LIB_DEPENDENCY}"
     "libcpp-httplib0.11, libfftw3-double3, "
     "libopencv-core406, libopencv-imgproc406, libopencv-imgcodecs406, "
     "libavcodec59, libavformat59, libavutil57, libswresample4, "

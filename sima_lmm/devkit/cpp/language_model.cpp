@@ -1,8 +1,11 @@
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <regex>
 #include <set>
+#include <stdexcept>
 
 #include <Eigen/Dense>
 #include <cnpy.h>
@@ -18,29 +21,90 @@
 namespace simaai {
 namespace llima {
 
+namespace {
+
+LogLikelihoodResult score_logits(
+    std::span<const Eigen::bfloat16> logits, uint32_t target_token_id
+) {
+    if (target_token_id >= logits.size()) {
+        throw std::runtime_error(
+            fmt::format(
+                "Target token id {} is outside logits vocabulary size {}",
+                target_token_id,
+                logits.size()
+            )
+        );
+    }
+
+    double max_logit = -std::numeric_limits<double>::infinity();
+    uint32_t argmax_token_id = 0;
+    for (size_t i = 0; i < logits.size(); ++i) {
+        const double value = static_cast<float>(logits[i]);
+        if (value > max_logit) {
+            max_logit = value;
+            argmax_token_id = static_cast<uint32_t>(i);
+        }
+    }
+
+    double exp_sum = 0.0;
+    for (const auto logit : logits) {
+        exp_sum += std::exp(static_cast<float>(logit) - max_logit);
+    }
+
+    const double target_logit = static_cast<float>(logits[target_token_id]);
+    return {
+        target_logit - (max_logit + std::log(exp_sum)),
+        argmax_token_id == target_token_id
+    };
+}
+
+}
+
+namespace {
+constexpr size_t PER_LAYER_EMBEDDING_MAX_SHARD_SIZE = 1024ULL * 1024 * 1024;
+}
+
 LanguageModel::LanguageModel(
     std::filesystem::path model_path,
     std::set<uint32_t> stop_token_ids,
     std::optional<uint32_t> image_token_id,
     std::optional<uint32_t> pad_token_id,
-    TextStreamer& text_streamer,
-    bool do_parallel_load
+    TextStreamer& text_streamer
 ) : BaseModel(model_path),
     _stop_token_ids(std::move(stop_token_ids)),
     _image_token_id(image_token_id),
     _pad_token_id(pad_token_id),
     _max_num_tokens(_cfg.pipeline_cfg.max_num_tokens),
     _text_streamer(text_streamer),
-    _do_parallel_load(do_parallel_load),
     _has_image_token(false),
     _is_running(false),
     _reloc_name(std::nullopt)
 {
+    if (
+        _cfg.pipeline_cfg.max_num_tokens == 0
+        || _cfg.pipeline_cfg.max_num_tokens % MAX_NUM_TOKENS_ALIGNMENT
+    ) {
+        throw std::runtime_error(
+            "max_num_tokens must be a positive multiple of 1024"
+        );
+    }
+    if (_cfg.lm_cfg.is_spec_decode() && _cfg.lm_cfg.attn_cfg.swa_enable) {
+        throw std::runtime_error(
+            "EAGLE3 speculative decoding does not support sliding-window attention"
+        );
+    }
+
     _use_group_token_models = (
         _cfg.pipeline_cfg.input_token_group_offsets.has_value()
         && _cfg.pipeline_cfg.input_token_group_offsets.value().size() > 0
     );
     _need_argmax = _cfg.lm_cfg.lm_head_num_splits > 1 || _cfg.pipeline_cfg.return_logits;
+
+    if (_uses_cpu_dequantized_embeddings() && !_cfg.pipeline_cfg.embeddings_scale.has_value()) {
+        throw std::runtime_error(
+            "Quantized multimodal embeddings require pipeline_cfg.embeddings_scale"
+        );
+    }
     
     // Backwards compatible for models without rope_dimension_count in config
     if (_cfg.lm_cfg.rope_cfg.rope_dimension_count == 0)
@@ -156,7 +220,8 @@ std::vector<std::map<uint8_t, MLABufferSlice>> LanguageModel::create_input_buffe
     define_buffer(
         "input_embeds",
         {num_padded_input_tokens, _cfg.lm_cfg.hidden_size},
-        embeddings_buf.get_dtype()
+        (_cfg.vm_cfg.has_value() && _cfg.mm_cfg.has_value())
+            ? "bfloat16" : embeddings_buf.get_dtype()
     );
     MLABuffer& input_embeds_buf = get_buffer("input_embeds");
     input_embeds_buf.allocate();
@@ -375,7 +440,6 @@ void LanguageModel::run_model_decode(
     ChronoTimer timer_tps(true);
     uint16_t token_idx;
     for (token_idx = num_input_tokens; token_idx < _max_num_tokens; ++token_idx ) {
-        _upload_per_layer_embedding_rows(std::span<const uint32_t>(&token_id, 1), 1);
         auto next_token_id = run_model_once(1, token_idx, num_input_tokens, token_id);
         _cached_token_ids.emplace_back(token_id);
         token_id = next_token_id;
@@ -399,6 +463,322 @@ void LanguageModel::run_model_decode(
 }
 
 
+LogLikelihoodResult LanguageModel::run_model_for_loglikelihood(
+    std::span<const uint32_t> input_token_ids,
+    size_t continuation_start,
+    std::span<const uint32_t> continuation_token_ids,
+    bool use_group_prefill
+) {
+    if (!_cfg.pipeline_cfg.return_logits) {
+        throw std::runtime_error(
+            "model not compiled with --return_logits; "
+            "accuracy/loglikelihood tasks are unsupported"
+        );
+    }
+    if (input_token_ids.empty()) {
+        throw std::runtime_error("Loglikelihood request must include at least one input token");
+    }
+    if (input_token_ids.size() > _max_num_tokens) {
+        throw std::runtime_error(
+            fmt::format(
+                "Loglikelihood input length {} exceeds max_num_tokens {}",
+                input_token_ids.size(),
+                _max_num_tokens
+            )
+        );
+    }
+    if (continuation_token_ids.empty()) {
+        throw std::runtime_error("Loglikelihood request must include continuation token ids");
+    }
+    if (continuation_start > input_token_ids.size()) {
+        throw std::runtime_error(
+            fmt::format(
+                "Continuation start {} exceeds input length {}",
+                continuation_start,
+                input_token_ids.size()
+            )
+        );
+    }
+    if (continuation_start + continuation_token_ids.size() > input_token_ids.size()) {
+        throw std::runtime_error(
+            fmt::format(
+                "Continuation span [{}:{}) exceeds input length {}",
+                continuation_start,
+                continuation_start + continuation_token_ids.size(),
+                input_token_ids.size()
+            )
+        );
+    }
+
+    _is_running = true;
+    double total_logprob = 0.0;
+    bool is_greedy = true;
+    const size_t continuation_end = continuation_start + continuation_token_ids.size();
+    size_t token_idx_begin = 0;
+
+    auto score_current_logits = [this](uint32_t target_token_id) -> LogLikelihoodResult {
+        MLABuffer* buf_ptr = &get_buffer("n1_buffer4");
+        buf_ptr->invalidate_cache();
+
+        const auto* logits_ptr = reinterpret_cast<const Eigen::bfloat16*>(
+            buf_ptr->get_virtual_addr()
+        );
+        return score_logits(
+            std::span<const Eigen::bfloat16>(logits_ptr, _cfg.lm_cfg.token_cfg.vocab_size),
+            target_token_id
+        );
+    };
+
+    try {
+        const size_t group_size = _cfg.pipeline_cfg.input_token_group_size;
+        const bool should_group_prefill = (
+            use_group_prefill && _use_group_token_models && group_size > 1
+        );
+        if (!should_group_prefill) {
+            // Single-token scoring rewrites the model cache from token zero without going
+            // through run_model_prefill(), so the cached-token metadata is no longer valid.
+            _cached_token_ids.clear();
+        }
+        if (should_group_prefill) {
+            create_input_buffers(input_token_ids);
+
+            // Include the final context token so the grouped prefill output scores the first
+            // continuation token, matching normal generation prefill behavior for short prompts.
+            const size_t prefill_token_count = continuation_start + 1;
+            std::span<const uint32_t> prefill_input_tokens(
+                input_token_ids.data(), prefill_token_count
+            );
+            auto num_cached_tokens = _set_input_text_embeds(prefill_input_tokens);
+            if (num_cached_tokens >= prefill_token_count && prefill_token_count > 0) {
+                // Force the last prefill block to run so n1_buffer4 contains logits for the
+                // final context token, not stale logits from a previous request.
+                num_cached_tokens = static_cast<uint16_t>(prefill_token_count - 1);
+            }
+            run_model_prefill(prefill_input_tokens, num_cached_tokens, std::nullopt);
+            if (!_is_running.load(std::memory_order_relaxed)) {
+                throw std::runtime_error("Loglikelihood group prefill was interrupted");
+            }
+            const auto first_token_score = score_current_logits(continuation_token_ids[0]);
+            total_logprob += first_token_score.logprob;
+            is_greedy = is_greedy && first_token_score.is_greedy;
+            token_idx_begin = prefill_token_count;
+        }
+
+        for (size_t token_idx = token_idx_begin; token_idx < input_token_ids.size(); ++token_idx) {
+            if (token_idx >= continuation_start && token_idx < continuation_end) {
+                const auto token_score = _run_model_once_for_loglikelihood(
+                    static_cast<uint16_t>(token_idx),
+                    input_token_ids[token_idx],
+                    continuation_token_ids[token_idx - continuation_start]
+                );
+                total_logprob += token_score.logprob;
+                is_greedy = is_greedy && token_score.is_greedy;
+            } else {
+                _run_model_once_for_loglikelihood_logits(
+                    static_cast<uint16_t>(token_idx), input_token_ids[token_idx]
+                );
+            }
+        }
+    } catch (...) {
+        _is_running = false;
+        throw;
+    }
+
+    _is_running = false;
+    return {total_logprob, is_greedy};
+}
+
+
+void LanguageModel::_run_model_once_for_loglikelihood_logits(
+    uint16_t token_idx, uint32_t input_token_id
+) {
+    constexpr uint16_t num_tokens = 1;
+    const uint16_t next_token_idx = token_idx + 1;
+    _logger->info("Processing token no. {}-{}", token_idx, next_token_idx);
+
+    // Loglikelihood only needs the single-token decode path to refresh n1_buffer4.
+    // Keep this separate from run_model_once(), which is shared by normal generation.
+    MLABuffer* normal_input_buf;
+    uint32_t normal_input_row;
+    if (_uses_cpu_dequantized_embeddings()) {
+        normal_input_buf = &get_buffer("decode_embedding");
+        normal_input_row = 0;
+        _dequantize_embedding_row(input_token_id, *normal_input_buf);
+        normal_input_buf->flush_cache();
+    } else {
+        normal_input_buf = &get_buffer("embeddings");
+        normal_input_row = input_token_id;
+    }
+
+    if (_uses_per_layer_inputs()) {
+        LanguageModelMapKey per_layer_key{num_tokens, 0, 0};
+        std::map<uint8_t, MLABufferSlice> per_layer_ifm_map;
+        const uint32_t per_layer_token_id = (
+            _image_token_id.has_value() && input_token_id == _image_token_id.value()
+        ) ? _pad_token_id.value() : input_token_id;
+        const size_t shard_idx = (
+            per_layer_token_id / _per_layer_embedding_rows_per_shard
+        );
+        const size_t row_in_shard = (
+            per_layer_token_id % _per_layer_embedding_rows_per_shard
+        );
+        auto* shard = _per_layer_embedding_shards[shard_idx];
+        per_layer_ifm_map.emplace(
+            std::piecewise_construct,
+            std::forward_as_tuple(0),
+            std::forward_as_tuple(
+                shard,
+                std::vector<uint32_t>{static_cast<uint32_t>(row_in_shard), 0},
+                std::vector<uint32_t>{1, static_cast<uint32_t>(shard->get_shape().back())}
+            )
+        );
+        per_layer_ifm_map.emplace(
+            std::piecewise_construct,
+            std::forward_as_tuple(1),
+            std::forward_as_tuple(
+                normal_input_buf,
+                std::vector<uint32_t>{normal_input_row, 0},
+                std::vector<uint32_t>{1, _cfg.lm_cfg.hidden_size}
+            )
+        );
+        _per_layer_model_map.at(per_layer_key).add_to_queue(&per_layer_ifm_map);
+    }
+
+    for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
+        LanguageModelMapKey model_key(num_tokens, layer_idx, token_idx);
+
+        std::map<uint8_t, MLABufferSlice> ifm_map;
+        if (layer_idx == 0) {
+            ifm_map.emplace(
+                std::piecewise_construct,
+                std::forward_as_tuple(0),
+                std::forward_as_tuple(
+                    normal_input_buf,
+                    std::vector<uint32_t>{normal_input_row, 0},
+                    std::vector<uint32_t>{1, _cfg.lm_cfg.hidden_size}
+                )
+            );
+        }
+        if (
+            _cfg.lm_cfg.layer_types[layer_idx] == "full_attention"
+            || _cfg.lm_cfg.layer_types[layer_idx] == "sliding_attention"
+        ) {
+            _pre_model_map.at(model_key).add_to_queue(&ifm_map);
+            _cache_model_map.at(model_key).add_to_queue();
+            _post_model_map.at(model_key).add_to_queue(&ifm_map);
+        } else if (_cfg.lm_cfg.layer_types[layer_idx] == "conv") {
+            LanguageModelMapKey conv_model_key(num_tokens, layer_idx, 0);
+            _conv_model_map.at(conv_model_key).add_to_queue(&ifm_map);
+
+            if (layer_idx != (_cfg.lm_cfg.num_hidden_layers - 1)) {
+                continue;
+            }
+
+            ifm_map.clear();
+            _conv_final_model_map.at(conv_model_key).add_to_queue(&ifm_map);
+        } else {
+            throw std::runtime_error(
+                std::string("Unsupported layer type: ") + _cfg.lm_cfg.layer_types[layer_idx]
+            );
+        }
+    }
+
+    MLAModelWithBuffer::run_queue();
+
+    if (!_cached_states.empty()) {
+        for (size_t i = 0; i < _checkpoint_boundaries.size(); ++i) {
+            if (_checkpoint_boundaries[i] == next_token_idx) {
+                _save_state_checkpoint(i, num_tokens, 1);
+                break;
+            }
+        }
+    }
+}
+
+
+LogLikelihoodResult LanguageModel::_run_model_once_for_loglikelihood(
+    uint16_t token_idx, uint32_t input_token_id, uint32_t target_token_id
+) {
+    if (!_cfg.pipeline_cfg.return_logits) {
+        throw std::runtime_error(
+            "model not compiled with --return_logits; "
+            "accuracy/loglikelihood tasks are unsupported"
+        );
+    }
+
+    _run_model_once_for_loglikelihood_logits(token_idx, input_token_id);
+
+    MLABuffer* buf_ptr = &get_buffer("n1_buffer4");
+    buf_ptr->invalidate_cache();
+
+    const auto* logits_ptr = reinterpret_cast<const Eigen::bfloat16*>(
+        buf_ptr->get_virtual_addr()
+    );
+    return score_logits(
+        std::span<const Eigen::bfloat16>(logits_ptr, _cfg.lm_cfg.token_cfg.vocab_size),
+        target_token_id
+    );
+}
+
+
+void LanguageModel::_upload_group_future_token_masks(
+    uint16_t num_tokens,
+    uint16_t token_idx
+) {
+    if (
+        num_tokens != _cfg.pipeline_cfg.input_token_group_size
+        || num_tokens == _cfg.lm_cfg.get_single_num_tokens()
+    ) {
+        return;
+    }
+
+    auto upload_group_mask = [&](
+        const std::string& name,
+        const std::string& layer_type,
+        uint16_t cache_token_idx_begin
+    ) {
+        const uint16_t effective_context = token_idx + num_tokens - cache_token_idx_begin;
+        const uint16_t mask_size = _get_cache_mask_size(
+            layer_type, effective_context, true
+        );
+        if (mask_size <= num_tokens) {
+            return;
+        }
+        const uint16_t effective_token_idx = token_idx - cache_token_idx_begin;
+        const uint16_t aligned_context = std::min<uint16_t>(
+            round_up_to(effective_context, mask_size),
+            _cfg.pipeline_cfg.max_num_tokens
+        );
+        std::vector<Eigen::bfloat16> mask(
+            num_tokens * aligned_context,
+            std::numeric_limits<Eigen::bfloat16>::lowest()
+        );
+        for (uint16_t row = 0; row < num_tokens; ++row) {
+            std::fill_n(
+                mask.begin() + row * aligned_context,
+                effective_token_idx + row + 1,
+                Eigen::bfloat16{0.0f}
+            );
+        }
+        get_buffer(name).upload(mask.data(), 0, mask.size() * sizeof(Eigen::bfloat16));
+    };
+
+    upload_group_mask(
+        "group_future_token_mask", "full_attention", 0
+    );
+    if (_cfg.lm_cfg.attn_cfg.swa_enable) {
+        const uint16_t cache_token_idx_begin = std::max(
+            0,
+            token_idx + num_tokens
+                - static_cast<int>(_cfg.lm_cfg.attn_cfg.sliding_window.value())
+        );
+        upload_group_mask(
+            "group_sliding_future_token_mask", "sliding_attention", cache_token_idx_begin
+        );
+    }
+}
+
+
 uint32_t LanguageModel::run_model_once(
     uint16_t num_tokens,
     uint16_t token_idx,
@@ -415,33 +795,65 @@ uint32_t LanguageModel::run_model_once(
     auto use_input_tokens = token_idx < num_input_tokens;
     _logger->info("Processing token no. {}-{}", token_idx, next_token_idx);
 
+    _upload_group_future_token_masks(num_tokens, token_idx);
+
+    MLABuffer* normal_input_buf;
+    uint32_t normal_input_row;
+    uint32_t normal_input_num_tokens;
+    if (use_input_tokens) {
+        normal_input_buf = &get_buffer("input_embeds");
+        normal_input_row = token_idx;
+        normal_input_num_tokens = num_tokens;
+    } else if (_uses_cpu_dequantized_embeddings()) {
+        normal_input_buf = &get_buffer("decode_embedding");
+        normal_input_row = 0;
+        normal_input_num_tokens = 1;
+        _dequantize_embedding_row(token_id, *normal_input_buf);
+        normal_input_buf->flush_cache();
+    } else {
+        normal_input_buf = &get_buffer("embeddings");
+        normal_input_row = token_id;
+        normal_input_num_tokens = 1;
+    }
+
     // Run the standalone per-layer projection model before the transformer stack (Gemma4 only).
-    // IFM1 (staging) is already filled by _compute_and_upload_per_layer_inputs_prefill or
-    // the decode gather.  Only IFM0 (input embeds) is dynamic and passed here.
+    // IFM0 uses the staging buffer for prefill; decode overrides it with one shard row.
+    // IFM1 is the normal embedding input.
     if (_uses_per_layer_inputs()) {
         LanguageModelMapKey per_layer_key{num_tokens, 0, 0};
         std::map<uint8_t, MLABufferSlice> per_layer_ifm_map;
-        if (use_input_tokens) {
-            per_layer_ifm_map.emplace(
-                std::piecewise_construct,
-                std::forward_as_tuple(1),
-                std::forward_as_tuple(
-                    &get_buffer("input_embeds"),
-                    std::vector<uint32_t>{token_idx, 0},
-                    std::vector<uint32_t>{num_tokens, _cfg.lm_cfg.hidden_size}
-                )
+        if (!use_input_tokens) {
+            // Decode has one generated token, so use its contiguous shard row directly and
+            // avoid copying it through the per-layer staging buffer.
+            const uint32_t per_layer_token_id = (
+                _image_token_id.has_value() && token_id == _image_token_id.value()
+            ) ? _pad_token_id.value() : token_id;
+            const size_t shard_idx = (
+                per_layer_token_id / _per_layer_embedding_rows_per_shard
             );
-        } else {
+            const size_t row_in_shard = (
+                per_layer_token_id % _per_layer_embedding_rows_per_shard
+            );
+            auto* shard = _per_layer_embedding_shards[shard_idx];
             per_layer_ifm_map.emplace(
                 std::piecewise_construct,
-                std::forward_as_tuple(1),
+                std::forward_as_tuple(0),
                 std::forward_as_tuple(
-                    &get_buffer("embeddings"),
-                    std::vector<uint32_t>{token_id, 0},
-                    std::vector<uint32_t>{1, _cfg.lm_cfg.hidden_size}
+                    shard,
+                    std::vector<uint32_t>{static_cast<uint32_t>(row_in_shard), 0},
+                    std::vector<uint32_t>{1, static_cast<uint32_t>(shard->get_shape().back())}
                 )
             );
         }
+        per_layer_ifm_map.emplace(
+            std::piecewise_construct,
+            std::forward_as_tuple(1),
+            std::forward_as_tuple(
+                normal_input_buf,
+                std::vector<uint32_t>{normal_input_row, 0},
+                std::vector<uint32_t>{normal_input_num_tokens, _cfg.lm_cfg.hidden_size}
+            )
+        );
         _per_layer_model_map.at(per_layer_key).add_to_queue(&per_layer_ifm_map);
     }
 
@@ -450,27 +862,15 @@ uint32_t LanguageModel::run_model_once(
 
         std::map<uint8_t, MLABufferSlice> ifm_map;
         if (layer_idx == 0) {
-            if (use_input_tokens) {
-                ifm_map.emplace(
-                    std::piecewise_construct,
-                    std::forward_as_tuple(0),
-                    std::forward_as_tuple(
-                        &get_buffer("input_embeds"),
-                        std::vector<uint32_t>{token_idx, 0},
-                        std::vector<uint32_t>{num_tokens, _cfg.lm_cfg.hidden_size}
-                    )
-                );
-            } else {
-                ifm_map.emplace(
-                    std::piecewise_construct,
-                    std::forward_as_tuple(0),
-                    std::forward_as_tuple(
-                        &get_buffer("embeddings"),
-                        std::vector<uint32_t>{token_id, 0},
-                        std::vector<uint32_t>{1, _cfg.lm_cfg.hidden_size}
-                    )
-                );
-            }
+            ifm_map.emplace(
+                std::piecewise_construct,
+                std::forward_as_tuple(0),
+                std::forward_as_tuple(
+                    normal_input_buf,
+                    std::vector<uint32_t>{normal_input_row, 0},
+                    std::vector<uint32_t>{normal_input_num_tokens, _cfg.lm_cfg.hidden_size}
+                )
+            );
         }
         if (
             _cfg.lm_cfg.layer_types[layer_idx] == "full_attention"
@@ -487,8 +887,21 @@ uint32_t LanguageModel::run_model_once(
 
             _cache_model_map.at(model_key).add_to_queue();
 
-            // Non-spec: last-layer post is n1, remap inputs to only the last input token's row.
-            // Spec: last-layer post is n{num_tokens}, keep full inputs.
+            const bool is_draft = _cfg.lm_cfg.is_spec_decode()
+                && _cfg.lm_cfg.speculative_decoding_cfg.value().is_draft;
+            const uint16_t single_num_tokens = _cfg.lm_cfg.get_single_num_tokens();
+            // Using the single post for the target's final layer is valid only when the
+            // draft does not require that layer's hidden states. If it does, use the
+            // group post for the final layer so all group hidden states remain available.
+            const bool use_single_post_for_target_group = (
+                _cfg.lm_cfg.is_spec_decode()
+                && !is_draft
+                && num_tokens != single_num_tokens
+                && layer_idx == _cfg.lm_cfg.num_hidden_layers - 1
+            );
+
+            // Non-spec uses n1 for the final row. Target speculative prefill
+            // reuses n16 and binds a contiguous window containing the final row.
             if (num_tokens > 1 && layer_idx == _cfg.lm_cfg.num_hidden_layers - 1
                 && !_cfg.lm_cfg.is_spec_decode()) {
                 ifm_map.clear();
@@ -518,6 +931,70 @@ uint32_t LanguageModel::run_model_once(
                     )
                 );
             }
+            if (use_single_post_for_target_group) {
+                const uint32_t last_valid_row = num_input_tokens - 1 - token_idx;
+                const uint32_t slice_start = last_valid_row >= single_num_tokens - 1
+                    ? last_valid_row - (single_num_tokens - 1)
+                    : 0;
+
+                ifm_map.clear();
+                ifm_map.emplace(
+                    std::piecewise_construct,
+                    std::forward_as_tuple(0),
+                    std::forward_as_tuple(
+                        nullptr,
+                        std::vector<uint32_t>{slice_start, 0},
+                        std::vector<uint32_t>{single_num_tokens, _cfg.lm_cfg.hidden_size}
+                    )
+                );
+                ifm_map.emplace(
+                    std::piecewise_construct,
+                    std::forward_as_tuple(1),
+                    std::forward_as_tuple(
+                        nullptr,
+                        std::vector<uint32_t>{slice_start, 0},
+                        std::vector<uint32_t>{
+                            single_num_tokens,
+                            _cfg.lm_cfg.attn_cfg.get_q_size(_cfg.lm_cfg.layer_types[layer_idx])
+                        }
+                    )
+                );
+                uint8_t post_ifm_idx = 2;
+                if (_uses_per_layer_inputs()) {
+                    const uint32_t layer_row_offset =
+                        static_cast<uint32_t>(layer_idx) * num_tokens;
+                    ifm_map.emplace(
+                        std::piecewise_construct,
+                        std::forward_as_tuple(post_ifm_idx++),
+                        std::forward_as_tuple(
+                            nullptr,
+                            std::vector<uint32_t>{layer_row_offset + slice_start, 0},
+                            std::vector<uint32_t>{
+                                single_num_tokens,
+                                _cfg.lm_cfg.hidden_size_per_layer_input
+                            }
+                        )
+                    );
+                }
+                if (
+                    _cfg.vm_cfg.has_value()
+                    && layer_idx < _cfg.vm_cfg.value().deepstack_visual_indexes.size()
+                ) {
+                    const auto buf_name = fmt::format("deepstack_feature_l{}_cache", layer_idx);
+                    ifm_map.emplace(
+                        std::piecewise_construct,
+                        std::forward_as_tuple(post_ifm_idx),
+                        std::forward_as_tuple(
+                            nullptr,
+                            std::vector<uint32_t>{token_idx + slice_start, 0},
+                            std::vector<uint32_t>{
+                                single_num_tokens,
+                                static_cast<uint32_t>(get_buffer(buf_name).get_shape().back())
+                            }
+                        )
+                    );
+                }
+            }
             if (_uses_per_layer_inputs() && num_tokens > 1
                 && layer_idx == _cfg.lm_cfg.num_hidden_layers - 1
                 && !_cfg.lm_cfg.is_spec_decode()) {
@@ -538,8 +1015,7 @@ uint32_t LanguageModel::run_model_once(
 
             // Spec-decoding capture: download n128_buffer1 (this layer's hidden
             // states) for layers 2, N/2, N-3 so the orchestrator can feed them
-            // into FC fusion. Spec mode requires SIMA_LLIMA_RUN_DISABLE_QUEUE=1
-            // so post has already run synchronously by the time we get here.
+            // into FC fusion.
             if (
                 _cfg.lm_cfg.is_spec_decode()
                 && layer_idx < _cfg.lm_cfg.num_hidden_layers - 1
@@ -552,6 +1028,7 @@ uint32_t LanguageModel::run_model_once(
                 };
                 auto it = std::find(capture_layers.begin(), capture_layers.end(), layer_idx);
                 if (it != capture_layers.end()) {
+                    MLAModelWithBuffer::run_queue();
                     if (_eagle3_intermediate_hidden_states.size() < capture_layers.size()) {
                         _eagle3_intermediate_hidden_states.resize(capture_layers.size());
                     }
@@ -602,7 +1079,7 @@ uint32_t LanguageModel::run_model_once(
     if (!_cached_states.empty()) {
         for (size_t i = 0; i < _checkpoint_boundaries.size(); ++i) {
             if (_checkpoint_boundaries[i] == next_token_idx) {
-                // With custom group offsets, a partial prefill group can land on a boundary;
+                // A partial prefill group can land exactly on a checkpoint boundary.
                 const uint16_t valid_tokens = next_token_idx - token_idx;
                 _save_state_checkpoint(i, num_tokens, valid_tokens);
                 break;
@@ -627,13 +1104,26 @@ uint32_t LanguageModel::run_model_once(
     uint32_t next_token_id;
     if (num_input_tokens <= next_token_idx) {
         if (_cfg.lm_cfg.is_spec_decode()) {
-            // Spec: read from n{num_tokens}_lm_split{i} (or n{num_tokens}_buffer4 if no splits).
-            // Last input token's row is (num_input_tokens - 1 - token_idx).
-            const uint32_t row = num_input_tokens - 1 - token_idx;
+            const bool is_draft = _cfg.lm_cfg.speculative_decoding_cfg.value().is_draft;
+            const uint16_t single_num_tokens = _cfg.lm_cfg.get_single_num_tokens();
+            const uint32_t last_valid_row = num_input_tokens - 1 - token_idx;
+            const bool used_single_post_for_target_group = (
+                !is_draft && num_tokens != single_num_tokens
+            );
+            const uint32_t slice_start = (
+                used_single_post_for_target_group
+                && last_valid_row >= single_num_tokens - 1
+            ) ? last_valid_row - (single_num_tokens - 1) : 0;
+            const uint32_t row = last_valid_row - slice_start;
+            const uint16_t logits_num_tokens = used_single_post_for_target_group
+                ? single_num_tokens
+                : num_tokens;
             const uint32_t vocab_size = _cfg.lm_cfg.get_lm_head_output_size();
 
             if (_cfg.lm_cfg.lm_head_num_splits == 1) {
-                MLABuffer* buf_ptr = &get_buffer(fmt::format("n{}_buffer4", num_tokens));
+                MLABuffer* buf_ptr = &get_buffer(
+                    fmt::format("n{}_buffer4", logits_num_tokens)
+                );
                 buf_ptr->invalidate_cache();
                 auto* ptr = reinterpret_cast<Eigen::bfloat16*>(buf_ptr->get_virtual_addr());
                 uint32_t best_idx = 0;
@@ -653,7 +1143,9 @@ uint32_t LanguageModel::run_model_once(
                 uint32_t i = 0;
                 for (uint32_t split_begin = 0; split_begin < vocab_size; split_begin += split_dim, ++i) {
                     uint32_t split_size = std::min(vocab_size, split_begin + split_dim) - split_begin;
-                    MLABuffer* buf_ptr = &get_buffer(fmt::format("n{}_lm_split{}", num_tokens, i));
+                    MLABuffer* buf_ptr = &get_buffer(
+                        fmt::format("n{}_lm_split{}", logits_num_tokens, i)
+                    );
                     buf_ptr->invalidate_cache();
                     auto* ptr = reinterpret_cast<Eigen::bfloat16*>(buf_ptr->get_virtual_addr());
                     for (uint32_t j = 0; j < split_size; ++j) {
@@ -689,15 +1181,21 @@ void LanguageModel::_initialize() {
 
     // Define and load the models in parallel.
     _define_models();
-    MLAModelWithBuffer::load_all_models(_do_parallel_load, _elf_dir / _cfg.language_model_name);
+    MLAModelWithBuffer::load_all_models(_elf_dir / _cfg.language_model_name);
 
     // Upload language embeddings (drafts use the target's embeddings, so skip).
     const bool is_draft = _cfg.lm_cfg.is_spec_decode()
         && _cfg.lm_cfg.speculative_decoding_cfg.value().is_draft;
     if (!is_draft) {
-        auto embeddings_file_name = _devkit_dir / (_cfg.language_model_name + "_embeddings.npy");
-        auto embeddings_tensor = cnpy::npy_load(embeddings_file_name);
-        get_buffer("embeddings").upload(embeddings_tensor.data<void>());
+        auto embeddings_file_name = _devkit_dir / (_cfg.language_model_name + "_embeddings.bin");
+        if (std::filesystem::exists(embeddings_file_name)) {
+            get_buffer("embeddings").load_file(embeddings_file_name);
+        } else {
+            // Compatibility with packages generated before raw embedding files were introduced.
+            embeddings_file_name = _devkit_dir / (_cfg.language_model_name + "_embeddings.npy");
+            auto embeddings_tensor = cnpy::npy_load(embeddings_file_name);
+            get_buffer("embeddings").upload(embeddings_tensor.data<void>());
+        }
     } else {
         // Load d2t mapping (int64 in npy, narrows to int32 — values fit easily).
         auto d2t_file_name = _devkit_dir / "d2t.npy";
@@ -746,21 +1244,14 @@ void LanguageModel::_initialize() {
     }
 
     if (_uses_per_layer_inputs()) {
-        auto file_name = _devkit_dir / (_cfg.language_model_name + "_per_layer_embeddings.bin");
-        const size_t num_values = static_cast<size_t>(_cfg.lm_cfg.token_cfg.vocab_size)
-                                * _cfg.lm_cfg.num_hidden_layers
-                                * _cfg.lm_cfg.hidden_size_per_layer_input;
-        _per_layer_embeddings_tensor.resize(num_values);
-        std::ifstream(file_name, std::ios::binary).read(
-            reinterpret_cast<char*>(_per_layer_embeddings_tensor.data()),
-            num_values * sizeof(Eigen::bfloat16)
-        );
+        _load_per_layer_embeddings();
     }
 
     // Upload the future token mask.
-    if (_cfg.pipeline_cfg.future_token_mask_size > 1) {
+    const uint16_t max_future_token_mask_size = _get_max_future_token_mask_size();
+    if (max_future_token_mask_size > 1) {
         std::vector<Eigen::bfloat16> future_token_mask(
-            _cfg.pipeline_cfg.future_token_mask_size - 1,
+            max_future_token_mask_size - 1,
             std::numeric_limits<Eigen::bfloat16>::lowest()
         );
         MLABuffer& future_token_mask_buf = get_buffer("future_token_mask");
@@ -772,7 +1263,6 @@ void LanguageModel::_initialize() {
             true
         );
     }
-
     // Clear the KV caches and caches states.
     for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
         if (_cfg.lm_cfg.layer_types[layer_idx] == "conv") {
@@ -907,12 +1397,14 @@ void LanguageModel::_define_buffers() {
     const bool is_draft = _cfg.lm_cfg.is_spec_decode()
         && _cfg.lm_cfg.speculative_decoding_cfg.value().is_draft;
     if (!is_draft) {
-        std::string embeddings_dtype = (_cfg.pipeline_cfg.quantize_embeddings)? "int8" : "bfloat16";
         define_buffer(
             "embeddings",
             {_cfg.lm_cfg.token_cfg.vocab_size, _cfg.lm_cfg.hidden_size},
             (_cfg.pipeline_cfg.quantize_embeddings)? "int8" : "bfloat16"
         );
+        if (_uses_cpu_dequantized_embeddings()) {
+            define_buffer("decode_embedding", {1, _cfg.lm_cfg.hidden_size});
+        }
     }
 
     // Frequency tables.
@@ -981,7 +1473,8 @@ void LanguageModel::_define_buffers() {
         const auto& num_tokens = _cfg.pipeline_cfg.input_token_group_size;
         num_tokens_vec.emplace_back(num_tokens);
     }
-    if (_cfg.pipeline_cfg.future_token_mask_size > 1) {
+    const uint16_t max_future_token_mask_size = _get_max_future_token_mask_size();
+    if (max_future_token_mask_size > 1) {
         if (_cfg.lm_cfg.is_spec_decode()) {
             define_buffer(
                 "future_token_mask",
@@ -989,13 +1482,43 @@ void LanguageModel::_define_buffers() {
             );
         } else {
             uint32_t full_token_mask_size = round_up_to_row(
-                _cfg.pipeline_cfg.max_num_tokens + _cfg.pipeline_cfg.future_token_mask_size - 1
+                _cfg.pipeline_cfg.max_num_tokens + max_future_token_mask_size - 1
             );
             define_buffer(
                 "future_token_mask",
                 {full_token_mask_size}
             );
         }
+    }
+    const uint16_t group_size = _cfg.pipeline_cfg.input_token_group_size;
+    if (
+        _use_group_token_models
+        && _get_cache_mask_size(
+            "full_attention", _cfg.pipeline_cfg.max_num_tokens, true
+        ) > group_size
+    ) {
+        define_buffer(
+            "group_future_token_mask",
+            {
+                static_cast<size_t>(group_size) * _cfg.pipeline_cfg.max_num_tokens
+            },
+            "bfloat16",
+            false
+        );
+    }
+    if (
+        _use_group_token_models
+        && _cfg.lm_cfg.attn_cfg.swa_enable
+        && _get_cache_mask_size(
+            "sliding_attention", _cfg.pipeline_cfg.max_num_tokens, true
+        ) > group_size
+    ) {
+        define_buffer(
+            "group_sliding_future_token_mask",
+            {static_cast<size_t>(group_size) * _cfg.pipeline_cfg.max_num_tokens},
+            "bfloat16",
+            false
+        );
     }
 
     for (const auto& num_tokens: num_tokens_vec) {
@@ -1046,14 +1569,42 @@ void LanguageModel::_define_buffers() {
     }
 
     if (_uses_per_layer_inputs()) {
-        // Input staging for the standalone per-layer model, filled from token-id gathers.
+        const std::string dtype = _cfg.pipeline_cfg.quantize_embeddings
+            ? "int8" : "bfloat16";
+        // Vocabulary sharding keeps every token's complete L*H row contiguous.
         const size_t out_dim = static_cast<size_t>(_cfg.lm_cfg.num_hidden_layers)
                              * _cfg.lm_cfg.hidden_size_per_layer_input;
-        define_buffer("per_layer_emb_staging_n1", {1, out_dim});
+        const size_t elem_size = _cfg.pipeline_cfg.quantize_embeddings
+            ? sizeof(int8_t) : sizeof(Eigen::bfloat16);
+        _per_layer_embedding_rows_per_shard = std::max<size_t>(
+            1, PER_LAYER_EMBEDDING_MAX_SHARD_SIZE / (out_dim * elem_size)
+        );
+        const size_t vocab_size = _cfg.lm_cfg.token_cfg.vocab_size;
+        const size_t num_shards = (
+            vocab_size + _per_layer_embedding_rows_per_shard - 1
+        ) / _per_layer_embedding_rows_per_shard;
+        _per_layer_embedding_shards.clear();
+        _per_layer_embedding_shards.reserve(num_shards);
+        for (size_t shard_idx = 0; shard_idx < num_shards; ++shard_idx) {
+            const size_t row_begin = shard_idx * _per_layer_embedding_rows_per_shard;
+            const size_t num_rows = std::min(
+                _per_layer_embedding_rows_per_shard, vocab_size - row_begin
+            );
+            const auto name = fmt::format("per_layer_embeddings_s{}", shard_idx);
+            define_buffer(
+                name,
+                {num_rows, out_dim},
+                dtype
+            );
+            _per_layer_embedding_shards.emplace_back(&get_buffer(name));
+        }
+        // Input staging for the standalone per-layer model, filled from token-id gathers.
+        define_buffer("per_layer_emb_staging_n1", {1, out_dim}, dtype);
         if (_use_group_token_models) {
             define_buffer(
                 fmt::format("per_layer_emb_staging_n{}", _cfg.pipeline_cfg.input_token_group_size),
-                {_cfg.pipeline_cfg.input_token_group_size, out_dim}
+                {_cfg.pipeline_cfg.input_token_group_size, out_dim},
+                dtype
             );
         }
     }
@@ -1068,6 +1619,11 @@ void LanguageModel::_define_buffers() {
         const auto lm_head_output_size = _cfg.lm_cfg.get_lm_head_output_size();
         const auto& split_dim = _cfg.lm_cfg.lm_head_split_dim;
         for (const auto& num_tokens: num_tokens_vec) {
+            // Target prefill reuses the single-token-group final post model
+            // (n16 for EAGLE3). Only drafts need group-width final-post outputs.
+            if (!is_draft && num_tokens != _cfg.lm_cfg.get_single_num_tokens()) {
+                continue;
+            }
             if (_cfg.lm_cfg.lm_head_num_splits == 1 && !_cfg.pipeline_cfg.return_logits) {
                 define_buffer(
                     fmt::format("n{}_buffer4", num_tokens), {num_tokens, 1}, "int32"
@@ -1235,7 +1791,44 @@ void LanguageModel::_define_attn_models_iter(
     uint16_t eff_num_cached_tokens = token_idx + num_tokens - cache_token_idx_begin;
     uint16_t aligned_eff_token_idx;
     uint16_t aligned_eff_num_cached_tokens;
-    if (num_tokens == single_num_tokens && _cfg.pipeline_cfg.future_token_mask_size > 1) {
+    const bool is_single_model = num_tokens == single_num_tokens;
+    const uint16_t sliding_window = _cfg.lm_cfg.attn_cfg.sliding_window.value_or(0);
+    const bool separate_sliding_cache = (
+        layer_type == "sliding_attention"
+        && _cfg.lm_cfg.attn_cfg.sliding_head_dim.has_value()
+        && _cfg.lm_cfg.attn_cfg.sliding_head_dim.value() != _cfg.lm_cfg.attn_cfg.head_dim
+    );
+    const bool sliding_cache_mask_differs = (
+        layer_type == "sliding_attention"
+        && !separate_sliding_cache
+        && (
+            _get_cache_mask_size("full_attention", sliding_window, true)
+                != _get_cache_mask_size("sliding_attention", sliding_window, true)
+            || _get_cache_mask_size("full_attention", sliding_window, false)
+                != _get_cache_mask_size("sliding_attention", sliding_window, false)
+        )
+    );
+    const bool use_sliding_cache = (
+        separate_sliding_cache
+        || (
+            sliding_cache_mask_differs
+            && eff_num_cached_tokens >= sliding_window
+        )
+    );
+    const std::string cache_layer_type = (
+        use_sliding_cache ? "sliding_attention" : "full_attention"
+    );
+    const uint16_t cache_mask_size = _get_cache_mask_size(
+        cache_layer_type, eff_num_cached_tokens, !is_single_model
+    );
+    const bool use_single_future_token_mask = (
+        is_single_model && cache_mask_size > 1
+    );
+    const bool use_group_future_token_mask = (
+        !is_single_model
+        && cache_mask_size > num_tokens
+    );
+    if (use_single_future_token_mask) {
         // Round up by total context (eff_num_cached_tokens = past_kv + num_tokens),
         // not by past_kv alone. For spec mode num_tokens=16: past_kv=114 ->
         // total=130 -> bucket=256 (cache_token_255). The old formula used
@@ -1243,10 +1836,16 @@ void LanguageModel::_define_attn_models_iter(
         // For spec mode it picked cache_token_127 even when the 16 new tokens
         // wouldn't fit, dropping mask data for the tail tree positions.
         aligned_eff_token_idx = std::min(
-            round_up_to(eff_num_cached_tokens, _cfg.pipeline_cfg.future_token_mask_size) - 1,
+            round_up_to(eff_num_cached_tokens, cache_mask_size) - 1,
             _cfg.pipeline_cfg.max_num_tokens - 1
         );
         aligned_eff_num_cached_tokens = aligned_eff_token_idx + 1;
+    } else if (use_group_future_token_mask) {
+        aligned_eff_num_cached_tokens = std::min<uint16_t>(
+            round_up_to(eff_num_cached_tokens, cache_mask_size),
+            _cfg.pipeline_cfg.max_num_tokens
+        );
+        aligned_eff_token_idx = aligned_eff_num_cached_tokens - num_tokens;
     } else {
         aligned_eff_token_idx = eff_token_idx;
         aligned_eff_num_cached_tokens = eff_num_cached_tokens;
@@ -1294,7 +1893,19 @@ void LanguageModel::_define_attn_models_iter(
         );
     }
 
-    if (num_tokens == single_num_tokens && _cfg.pipeline_cfg.future_token_mask_size > 1) {
+    if (use_group_future_token_mask) {
+        cache_ifms.emplace_back(
+            MLABufferSlice{
+                &get_buffer(
+                    cache_layer_type == "sliding_attention"
+                        ? "group_sliding_future_token_mask"
+                        : "group_future_token_mask"
+                ),
+                {0},
+                {static_cast<uint32_t>(num_tokens) * aligned_eff_num_cached_tokens}
+            }
+        );
+    } else if (use_single_future_token_mask) {
         if (_cfg.lm_cfg.is_spec_decode()) {
             // Shift the col begin to cache_token_idx_begin so that buffer col
             // p ↔ K-row p for any layer type: full (cache_token_idx_begin = 0)
@@ -1345,7 +1956,7 @@ void LanguageModel::_define_attn_models_iter(
     _define_model(
         "cache",
         model_key,
-        _get_elf_path_cache(num_tokens, aligned_eff_token_idx, layer_idx),
+        _get_elf_path_cache(num_tokens, aligned_eff_token_idx, use_sliding_cache),
         cache_ifms,
         cache_ofms
     );
@@ -1353,12 +1964,33 @@ void LanguageModel::_define_attn_models_iter(
     // Post model. For draft, post IFM 0 is the FC fusion output (pre IFM 1), not the
     // token embeddings (pre IFM 0). For target, pre IFM 0 is the hidden state directly.
     std::vector<MLABufferSlice> post_ifms{is_draft ? pre_ifms[1] : pre_ifms[0], cache_ofms[0]};
+    const bool use_single_post_for_target_group = (
+        _cfg.lm_cfg.is_spec_decode()
+        && !is_draft
+        && num_tokens != single_num_tokens
+        && layer_idx == _cfg.lm_cfg.num_hidden_layers - 1
+    );
+    if (use_single_post_for_target_group) {
+        post_ifms[0] = MLABufferSlice{
+            post_ifms[0].get_buf_ptr(),
+            {0, 0},
+            {single_num_tokens, _cfg.lm_cfg.hidden_size}
+        };
+        post_ifms[1] = MLABufferSlice{
+            post_ifms[1].get_buf_ptr(),
+            {0, 0},
+            {single_num_tokens, _cfg.lm_cfg.attn_cfg.get_q_size(layer_type)}
+        };
+    }
     if (_uses_per_layer_inputs()) {
         post_ifms.emplace_back(
             MLABufferSlice{
                 &get_buffer(fmt::format("n{}_per_layer_input", num_tokens)),
                 std::vector<uint32_t>{static_cast<uint32_t>(layer_idx) * num_tokens, 0},
-                std::vector<uint32_t>{num_tokens, _cfg.lm_cfg.hidden_size_per_layer_input}
+                std::vector<uint32_t>{
+                    use_single_post_for_target_group ? single_num_tokens : num_tokens,
+                    _cfg.lm_cfg.hidden_size_per_layer_input
+                }
             }
         );
     }
@@ -1372,7 +2004,10 @@ void LanguageModel::_define_attn_models_iter(
             MLABufferSlice{
                 &get_buffer(buf_name),
                 {token_idx, 0},
-                {num_tokens, (uint32_t)get_buffer(buf_name).get_shape().back()}
+                {
+                    use_single_post_for_target_group ? single_num_tokens : num_tokens,
+                    (uint32_t)get_buffer(buf_name).get_shape().back()
+                }
             }
         );
     }
@@ -1384,13 +2019,16 @@ void LanguageModel::_define_attn_models_iter(
         );
         post_elf_path = _get_elf_path_post(num_tokens, layer_idx);
     } else {
-        // Last-layer post. ELF and output buffer differ in spec vs non-spec mode.
-        const uint16_t post_num_tokens = _cfg.lm_cfg.is_spec_decode() ? num_tokens : 1;
+        // Target speculative prefill only needs the final valid prompt row's
+        // logits, so reuse the n16 verification post instead of loading n128.
+        const uint16_t post_num_tokens = use_single_post_for_target_group
+            ? single_num_tokens
+            : (_cfg.lm_cfg.is_spec_decode() ? num_tokens : 1);
         post_elf_path = _get_elf_path_post(post_num_tokens, layer_idx);
 
         if (_cfg.lm_cfg.lm_head_num_splits == 1) {
             const std::string buf_name = _cfg.lm_cfg.is_spec_decode()
-                ? fmt::format("n{}_buffer4", num_tokens)
+                ? fmt::format("n{}_buffer4", post_num_tokens)
                 : std::string("n1_buffer4");
             post_ofms.emplace_back(MLABufferSlice{&get_buffer(buf_name)});
         } else {
@@ -1404,7 +2042,9 @@ void LanguageModel::_define_attn_models_iter(
                      split_begin += split_dim, ++i)
                 {
                     post_ofms.emplace_back(
-                        MLABufferSlice{&get_buffer(fmt::format("n{}_lm_split{}", num_tokens, i))}
+                        MLABufferSlice{
+                            &get_buffer(fmt::format("n{}_lm_split{}", post_num_tokens, i))
+                        }
                     );
                 }
             } else {
@@ -1836,16 +2476,11 @@ std::filesystem::path LanguageModel::_get_elf_path_pre(uint16_t num_tokens, uint
 
 
 std::filesystem::path LanguageModel::_get_elf_path_cache(
-    uint16_t num_tokens, uint16_t token_idx, uint8_t layer_idx
+    uint16_t num_tokens,
+    uint16_t token_idx,
+    bool use_sliding_cache
 ) {
-    std::string cache_name = "cache";
-    if (
-        _cfg.lm_cfg.layer_types[layer_idx] == "sliding_attention"
-        && _cfg.lm_cfg.attn_cfg.sliding_head_dim.has_value()
-        && _cfg.lm_cfg.attn_cfg.sliding_head_dim.value() != _cfg.lm_cfg.attn_cfg.head_dim
-    ) {
-        cache_name = "sliding_cache";
-    }
+    const std::string cache_name = use_sliding_cache ? "sliding_cache" : "cache";
     auto elf_file_name = fmt::format(
         "{}_n{}_{}_token{}_stage1_mla.elf",
         _cfg.language_model_name,
@@ -1889,20 +2524,42 @@ std::filesystem::path LanguageModel::_get_elf_path_per_layer(uint16_t num_tokens
 }
 
 
+void LanguageModel::_dequantize_embedding_row(
+    uint32_t token_id, MLABuffer& dst, size_t dst_row
+) {
+    const auto& embeddings = get_buffer("embeddings");
+    const size_t hidden_size = embeddings.get_shape().back();
+    const auto* src = reinterpret_cast<const int8_t*>(embeddings.get_virtual_addr())
+                    + static_cast<size_t>(token_id) * hidden_size;
+    auto* dst_row_ptr = reinterpret_cast<Eigen::bfloat16*>(
+        reinterpret_cast<uint8_t*>(dst.get_virtual_addr())
+        + dst_row * hidden_size * dst.get_elem_size()
+    );
+    const float scale = _cfg.pipeline_cfg.embeddings_scale.value();
+    using Int8Row = Eigen::Array<int8_t, 1, Eigen::Dynamic>;
+    Eigen::Map<const Int8Row> src_row(src, static_cast<Eigen::Index>(hidden_size));
+    Eigen::Map<ArrayXbf> dst_row_map(dst_row_ptr, static_cast<Eigen::Index>(hidden_size));
+    dst_row_map = (src_row.cast<float>() * scale).cast<Eigen::bfloat16>();
+}
+
+
 uint16_t LanguageModel::_set_input_text_embeds(std::span<const uint32_t> input_token_ids) {
     // Log.
     _logger->info("Cached token ids: [{}]", fmt::join(_cached_token_ids, ", "));
 
     const uint16_t num_input_tokens = input_token_ids.size();
     const auto& embeddings_buf = get_buffer("embeddings");
-    const auto elem_size = embeddings_buf.get_elem_size();
+    const size_t embeddings_elem_size = embeddings_buf.get_elem_size();
     const auto& embeddings_shape = embeddings_buf.get_shape();
-    const uint16_t embed_size = embeddings_shape.back() * elem_size;
+    const size_t embeddings_row_size = embeddings_shape.back() * embeddings_elem_size;
     const uint8_t* embeddings_ptr = (
         reinterpret_cast<const uint8_t*>(embeddings_buf.get_virtual_addr())
     );
 
     MLABuffer& buf = get_buffer("input_embeds");
+    const size_t input_row_size = embeddings_shape.back() * buf.get_elem_size();
+    const bool dequantize = embeddings_buf.get_dtype() == "int8"
+        && buf.get_dtype() == "bfloat16";
     uint32_t token_idx = 0;
     uint32_t num_images = 0;
     uint16_t num_cached_tokens = 0;
@@ -1910,20 +2567,23 @@ uint16_t LanguageModel::_set_input_text_embeds(std::span<const uint32_t> input_t
         const auto& token_id = input_token_ids[token_idx];
         if (_image_token_id.has_value() && token_id == _image_token_id.value()) {
             auto next_token_idx = token_idx + _cfg.mm_cfg.value().mm_tokens_per_image;
-            if (next_token_idx == num_input_tokens)
-                buf.flush_cache();
             ++num_images;
             token_idx = next_token_idx;
         } else {
             auto next_token_idx = token_idx + 1;
-            buf.upload(
-                embeddings_ptr + token_id * embed_size,
-                token_idx * embed_size,
-                embed_size,
-                next_token_idx == num_input_tokens
-            );
+            if (dequantize) {
+                _dequantize_embedding_row(token_id, buf, token_idx);
+            } else {
+                buf.upload(
+                    embeddings_ptr + token_id * embeddings_row_size,
+                    token_idx * input_row_size,
+                    input_row_size,
+                    false
+                );
+            }
             if (
                 num_images == 0
+                && token_idx == num_cached_tokens
                 && token_idx < _cached_token_ids.size()
                 && token_id == _cached_token_ids[token_idx]
             )
@@ -1931,6 +2591,7 @@ uint16_t LanguageModel::_set_input_text_embeds(std::span<const uint32_t> input_t
             token_idx = next_token_idx;
         }
     }
+    buf.flush_cache();
 
     // Update rope table if needed.
     if (
@@ -1969,18 +2630,54 @@ std::vector<uint32_t> LanguageModel::_get_per_layer_token_ids(
 }
 
 
+void LanguageModel::_load_per_layer_embeddings() {
+    const auto file_name = (
+        _devkit_dir / (_cfg.language_model_name + "_per_layer_embeddings.bin")
+    );
+    const size_t vocab_size = _cfg.lm_cfg.token_cfg.vocab_size;
+    const size_t out_dim = static_cast<size_t>(_cfg.lm_cfg.num_hidden_layers)
+                         * _cfg.lm_cfg.hidden_size_per_layer_input;
+    const size_t elem_size = _cfg.pipeline_cfg.quantize_embeddings
+        ? sizeof(int8_t) : sizeof(Eigen::bfloat16);
+    const size_t token_row_size = out_dim * elem_size;
+    const size_t expected_size = vocab_size * token_row_size;
+    const size_t actual_size = std::filesystem::file_size(file_name);
+    if (actual_size != expected_size) {
+        throw std::runtime_error(fmt::format(
+            "Invalid size for {}: expected {} bytes, got {}",
+            file_name, expected_size, actual_size
+        ));
+    }
+
+    // Stream contiguous token rows directly into MLA shards to avoid a full host copy.
+    std::ifstream stream(file_name, std::ios::binary);
+    for (auto* shard : _per_layer_embedding_shards) {
+        if (shard->get_buf_len() != shard->get_shape()[0] * token_row_size) {
+            throw std::runtime_error(fmt::format(
+                "Per-layer embedding rows require unsupported MLA padding: {}",
+                shard->get_name()
+            ));
+        }
+        shard->load_stream(stream);
+    }
+}
+
+
 void LanguageModel::_upload_per_layer_embedding_rows(
     std::span<const uint32_t> token_ids, uint16_t num_tokens
 ) {
     if (!_uses_per_layer_inputs())
         return;
-    const size_t out_dim = static_cast<size_t>(_cfg.lm_cfg.num_hidden_layers)
-                         * _cfg.lm_cfg.hidden_size_per_layer_input;
     auto& staging = get_buffer(fmt::format("per_layer_emb_staging_n{}", num_tokens));
-    auto* dst = reinterpret_cast<Eigen::bfloat16*>(staging.get_virtual_addr());
+    const size_t row_size = staging.get_shape().back() * staging.get_elem_size();
+    auto* dst = reinterpret_cast<uint8_t*>(staging.get_virtual_addr());
     for (uint16_t i = 0; i < num_tokens; ++i) {
-        const auto* src = _per_layer_embeddings_tensor.data() + token_ids[i] * out_dim;
-        std::memcpy(dst + i * out_dim, src, out_dim * sizeof(Eigen::bfloat16));
+        const size_t shard_idx = token_ids[i] / _per_layer_embedding_rows_per_shard;
+        const size_t row_in_shard = token_ids[i] % _per_layer_embedding_rows_per_shard;
+        const auto* src = reinterpret_cast<const uint8_t*>(
+            _per_layer_embedding_shards[shard_idx]->get_virtual_addr()
+        ) + row_in_shard * row_size;
+        std::memcpy(dst + i * row_size, src, row_size);
     }
     staging.flush_cache();
 }
