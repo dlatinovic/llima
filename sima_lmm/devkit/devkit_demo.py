@@ -10,13 +10,16 @@ from enum import Enum
 from pathlib import Path
 
 from sima_lmm.devkit.utils import CLI, WEB, ZMQServer, connect, disconnect
-from sima_lmm.devkit import model_manager
+from sima_lmm.devkit.model_manager import ModelManager
 from sima_utils.logging.sima_logger import (
     _get_logging_config as sima_get_logging_config,
     _initialize_logger as sima_initialize_logger,
     sima_log_exception,
     sima_log_info,
 )
+
+
+MODEL_MANAGER = ModelManager()
 
 
 # Common codes for both CLI and WEB modes.
@@ -40,10 +43,10 @@ def _init_logging(mode: DemoMode, log_level: str | None) -> None:
 
 
 def _resolve_run_model_path(model: str) -> Path:
-    resolved = model_manager.resolve_model_path(model)
+    resolved = MODEL_MANAGER.resolve(model)
     if resolved is None:
         print("Model not found.", flush=True)
-        available = model_manager.list_models()
+        available = MODEL_MANAGER.list()
         if available:
             print("Available local models:", flush=True)
             for model_dir in available:
@@ -125,7 +128,13 @@ def _resolve_target_and_draft_paths(model_path: Path) -> tuple[Path, Path | None
 
 def _kill_existing_llima_session() -> None:
     result = subprocess.run(
-        ["pkill", "--older", "60", "-f", "[l]lima"],
+        [
+            "pkill",
+            "--older",
+            "60",
+            "-f",
+            "[l]lima (run|benchmark-server)( |$)",
+        ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         check=False,
@@ -237,7 +246,7 @@ def run_model(args: argparse.Namespace) -> int:
 
 
 def search_models(args: argparse.Namespace) -> int:
-    results = model_manager.search_models(args.term)
+    results = MODEL_MANAGER.search(args.term)
     if not results:
         print("No models found.", flush=True)
     else:
@@ -247,14 +256,14 @@ def search_models(args: argparse.Namespace) -> int:
 
 
 def pull_model(args: argparse.Namespace) -> int:
-    model_dir = model_manager.pull_model(args.model)
+    model_dir = MODEL_MANAGER.pull(args.model)
     print(f"Downloaded to {model_dir}", flush=True)
     return 0
 
 
 def list_models(args: argparse.Namespace) -> int:
     del args
-    models = model_manager.list_models()
+    models = MODEL_MANAGER.list()
     if not models:
         print("No models found.", flush=True)
     else:
@@ -264,7 +273,7 @@ def list_models(args: argparse.Namespace) -> int:
 
 
 def rm_model(args: argparse.Namespace) -> int:
-    removed = model_manager.rm_model(args.model)
+    removed = MODEL_MANAGER.remove(args.model)
     if not removed:
         print(f"Model not found: {args.model}", flush=True)
         return 1

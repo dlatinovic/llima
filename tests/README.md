@@ -54,7 +54,7 @@ export LLIMA_HF_MODELS_PATH=/path/to/llima-model-inputs
 
 - Location: `tests/compilation/unit/`
 - Marker: `compiler_unit`
-- Expected cases: 48
+- Expected cases: 56
 
 Fast, hermetic tests that run before model inputs are downloaded:
 
@@ -161,13 +161,15 @@ This bounded end-to-end case:
 
 1. Selects an eligible model deterministically from the candidate commit SHA.
 2. Resolves and validates cached source provenance.
-3. Generates ONNX.
-4. Quantizes the selected model component.
+3. Generates a floating-point Model SDK graph directly from the source model.
+4. Quantizes the Model SDK graph.
 5. Invokes Model Compiler.
 6. Validates the resulting MPK archive and MLA ELF.
 
 The test selects layer 0 and INT4 quantization to cover the complete pipeline
-without compiling an entire generative model. It is serial and high-memory.
+without compiling an entire generative model. The staged commands follow the
+default direct Model SDK compilation path while preserving per-stage timings
+and diagnostics. It is serial and high-memory.
 
 ### Compiler test definitions and helpers
 
@@ -275,12 +277,14 @@ the installed runtime and use the image and audio assets installed by
 
 ### GenAI model preparation
 
-The dedicated `Prepare GenAI models` step keeps the runtime fixtures aligned
-with Core:
+The dedicated `Prepare GenAI models` step keeps the shared runtime fixtures
+aligned with Core and adds two LLiMa-specific reasoning fixtures:
 
 - `Qwen2.5-0.5B-Instruct-GPTQ-a16w4`
 - `LFM2.5-VL-450M-a16w4`
 - `whisper-small-a16w8`
+- `Qwen3-0.6B-GPTQ-a16w4`
+- `Gemma-4-E2B-it-GPTQ-a16w4`
 
 The shared environment contract is:
 
@@ -288,6 +292,8 @@ The shared environment contract is:
 - `SIMA_TEST_LLIMA_TEXT_MODEL`
 - `SIMA_TEST_LLIMA_VLM_MODEL`
 - `SIMA_TEST_LLIMA_ASR_MODEL`
+- `SIMA_TEST_LLIMA_REASONING_QWEN_MODEL`
+- `SIMA_TEST_LLIMA_REASONING_GEMMA_MODEL`
 
 Models are retained on the runner between CI runs.
 
@@ -302,6 +308,7 @@ CTest executes serially with a dispatcher resource lock:
 | `runtime.vision_generation` | LFM2 image-conditioned generation using the installed sample image |
 | `runtime.asr_transcription` | Whisper transcription using the installed sample audio |
 | `runtime.tool_call_parser` | Tool-call parsing safety and streaming provenance without model inference |
+| `runtime.reasoning_parser` | Qwen/Gemma reasoning boundary parsing and streaming provenance without model inference |
 
 The executables link directly against the in-tree runtime while building, then
 use install RPATHs to load the installed runtime and dispatcher libraries on
@@ -315,7 +322,9 @@ Pytest validates the installed package and external interfaces:
 |------|----------|
 | Installed Python lifecycle | Imports the installed extension and connects to and disconnects from the dispatcher |
 | CLI black box | Starts `llima`, submits a real Qwen query, validates the answer, sends `quit`, and verifies teardown |
-| OpenAI-compatible HTTP | Non-streaming response, SSE reconstruction, `/stop`, malformed-input recovery, and a successful request after interruption |
+| MLA memory cleanup | Runs Qwen four times through `llima run -> quit`, checks `/dev/simaai-mem` after every exit, and verifies that the daemon PID and allocation baseline remain stable |
+| Model manager | Hermetically validates concurrent downloads, transient retries, cancellation, largest-first scheduling, locking, and file-granular resume without accessing the network or dispatcher |
+| OpenAI/Ollama HTTP | Existing recovery and cancellation coverage plus real Qwen3/Gemma4 reasoning separation for streaming, non-streaming, thinking-disabled, and structured tool-call requests |
 | ZMQ black box | CURVE-secured MessagePack request, generated tensor response, and remote server shutdown |
 
 `tests/runtime/pytest.ini` is packaged with these tests and prevents compiler
@@ -333,6 +342,21 @@ subsequent execution:
 - Does not grow daemon thread or file-descriptor counts.
 - Reaps the `llima` process.
 - Returns CMA memory within the configured tolerance.
+
+The MLA memory cleanup regression test performs four sequential Qwen
+`llima run -> quit` cycles without restarting `simaai-appcomplex.service`.
+After every cycle it checks the allocation summary from `/dev/simaai-mem`
+against the initial baseline and reports stale 512 MiB target-2 buffers with
+their owner PIDs. The repeat count, run timeout, cleanup timeout, and log
+directory can be overridden with:
+
+- `SIMA_TEST_LLIMA_MEMORY_REPEAT_COUNT`
+- `SIMA_TEST_LLIMA_MEMORY_RUN_TIMEOUT_SECONDS`
+- `SIMA_TEST_LLIMA_MEMORY_CLEANUP_TIMEOUT_SECONDS`
+- `SIMA_TEST_LLIMA_MEMORY_LOG_DIR`
+
+When a persistent log directory is configured, each test invocation writes to
+its own `run-*` subdirectory so earlier results remain available.
 
 ### Cancellation and test isolation
 
