@@ -1132,6 +1132,56 @@ class ModelGraph(SimaBuilder):
         )
         return self.create_conv_node(input_node, weights, None, conv_attrs)
 
+    def channel_mix(
+        self,
+        data: NodeOrHandle,
+        channel_matrix: np.ndarray,
+        channel_bias: np.ndarray | None = None,
+    ) -> NodeOrHandle:
+        """Apply a fixed linear map over the channel axis as a 1x1 convolution.
+
+        A channel permutation cannot be expressed with a slice and a concatenate on the MLA:
+        the N2A converter re-derives in-order splits from a slice-concat, so an out-of-order
+        channel arrangement is lost. TVM canonicalization solves this by rewriting such a
+        pattern into a 1x1 convolution (ChannelReverseSliceConcatToConv); this builds the same
+        thing directly. A matrix that only selects or negates whole channels stays exact in
+        every supported precision, because per-channel weight quantization of a single +-1
+        value is lossless.
+
+        Args:
+            data: The input node.
+            channel_matrix: The map to apply, shaped (input_channels, output_channels).
+            channel_bias: Optional addend, shaped (output_channels,).
+        """
+        input_type = tensor_type(data)
+        input_channels, output_channels = channel_matrix.shape
+        if input_channels != input_type.shape[-1]:
+            raise ValueError(
+                f"channel_mix matrix has {input_channels} input channels; "
+                f"the input has {input_type.shape[-1]}"
+            )
+        if channel_bias is not None and channel_bias.shape != (output_channels,):
+            raise ValueError(
+                f"channel_mix bias must have shape ({output_channels},); got {channel_bias.shape}"
+            )
+
+        # SiMaIR expects weights in HWIGO layout.
+        weights = channel_matrix.astype(np.float32).reshape(1, 1, input_channels, 1, output_channels)
+        conv_attrs = ConvAttrs(
+            stride=(1, 1),
+            dilation=(1, 1),
+            padding=((0, 0), (0, 0)),
+            output_padding=((0, 0), (0, 0)),
+            is_transposed=False,
+            weight_shape=weights.shape,
+            reloc_name=None,
+            input_spatial_shape=input_type.shape[1:-1],
+            batch_size=input_type.shape[0],
+            input_type=input_type.scalar,
+        )
+        bias = None if channel_bias is None else channel_bias.astype(np.float32)
+        return self.create_conv_node(data, weights, bias, conv_attrs)
+
     def _build_conv_lora(
         self, base_name: str, ifm: NodeOrHandle, lora_shape: tuple[int, int]
     ) -> AwesomeNode:
