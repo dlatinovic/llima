@@ -59,6 +59,57 @@ class LanguagePreModel(LanguagePartBaseModel):
     def _kv_size(self) -> int:
         return self.cfg.lm_cfg.attn_cfg.get_kv_size(self.layer_type)
 
+    @property
+    def _rope_channel_layout(self) -> tuple[int, int, int]:
+        """
+        Channel layout of this layer's rotation: (head_dim, half_rope_dim, imag_start).
+
+        The rotation pairs channel i with channel imag_start + i for i < half_rope_dim and
+        leaves every other channel unchanged. Partial RoPE rotates a prefix of the head and
+        passes the tail through; proportional RoPE (Gemma4 full-attention layers) keeps the
+        imaginary half at head_dim // 2, so an unrotated segment sits between the halves.
+        """
+        head_dim = self._head_dim
+        half_rope_dim = self.cfg.lm_cfg.rope_cfg.get_rope_dimension_count(self.layer_type) // 2
+        imag_start = head_dim // 2 if self._is_proportional_rope_layer else half_rope_dim
+        return head_dim, half_rope_dim, imag_start
+
+    def _rope_rotate_half_matrix(self) -> np.ndarray:
+        """
+        Channel map of the rotation's imaginary term, HuggingFace's rotate_half with the
+        sign of the real part folded in: output channel i is -data[imag_start + i] and
+        output channel imag_start + i is data[i]. Unrotated channels map to zero, which the
+        neutral sin value of _rope_frequency_expansion then discards.
+        """
+        head_dim, half_rope_dim, imag_start = self._rope_channel_layout
+        matrix = np.zeros((head_dim, head_dim), dtype=np.float32)
+        for i in range(half_rope_dim):
+            matrix[imag_start + i, i] = -1.0
+            matrix[i, imag_start + i] = 1.0
+        return matrix
+
+    def _rope_frequency_expansion(
+            self, neutral_value: float
+    ) -> tuple[np.ndarray, np.ndarray | None]:
+        """
+        Channel map and bias that widen a frequency table to head_dim channels.
+
+        The runtime uploads cos and sin for rope_dimension_count // 2 channels only, which
+        is the vlm_config.json contract, so each frequency channel has to be duplicated
+        onto both channels of its rotation pair. Unrotated channels take `neutral_value`,
+        1 for cos and 0 for sin, which leaves them unchanged by the rotation.
+        """
+        head_dim, half_rope_dim, imag_start = self._rope_channel_layout
+        matrix = np.zeros((half_rope_dim, head_dim), dtype=np.float32)
+        for i in range(half_rope_dim):
+            matrix[i, i] = 1.0
+            matrix[i, imag_start + i] = 1.0
+
+        bias = np.full(head_dim, neutral_value, dtype=np.float32)
+        bias[:half_rope_dim] = 0.0
+        bias[imag_start:imag_start + half_rope_dim] = 0.0
+        return matrix, bias if bias.any() else None
+
     def generate_graph(
         self,
         layer_cfg: LayerConfiguration,
@@ -109,12 +160,15 @@ class LanguagePreModel(LanguagePartBaseModel):
             attn_input = graph.concat([rms_norm, hidden_states_norm], 3)
         else:
             attn_input = rms_norm
+        rope_cos, rope_sin = self._build_rope_frequencies(
+            graph, mla_input_freq_real, mla_input_freq_imag
+        )
         mla_q_result = self._build_attn_query(
             graph,
             f"{base_name}.self_attn",
             attn_input,
-            mla_input_freq_real,
-            mla_input_freq_imag,
+            rope_cos,
+            rope_sin,
             merged_lora,
         )
         gate_out = None
@@ -128,8 +182,8 @@ class LanguagePreModel(LanguagePartBaseModel):
                 graph,
                 f"{base_name}.self_attn",
                 attn_input,
-                mla_input_freq_real,
-                mla_input_freq_imag,
+                rope_cos,
+                rope_sin,
                 merged_lora,
             )
             mla_v_out = self._build_attn_value(
@@ -147,27 +201,43 @@ class LanguagePreModel(LanguagePartBaseModel):
             output_nodes.append(gate_out)
         graph.save(output_nodes)
 
-    def _build_rotary_emb(
-        self, graph: ModelGraph, data: Node, freq_real: Node, freq_imag: Node
-    ):
+    def _build_rope_frequencies(
+        self, graph: ModelGraph, freq_real: Node, freq_imag: Node
+    ) -> tuple[Node, Node]:
         """
-        Create nodes that compute rotary embedding.
+        Create nodes that widen the frequency inputs to head_dim-wide cos and sin tables.
+
+        Built once per part and shared by the query and key rotations.
         """
-        return graph.rope(
-            data,
-            freq_real,
-            freq_imag,
-            self.cfg.lm_cfg.rope_cfg.get_rope_dimension_count(self.layer_type),
-            proportional=self._is_proportional_rope_layer,
+        expansion, cos_bias = self._rope_frequency_expansion(1.0)
+        return (
+            graph.channel_mix(freq_real, expansion, cos_bias),
+            graph.channel_mix(freq_imag, expansion),
         )
+
+    def _build_rotary_emb(
+        self, graph: ModelGraph, data: Node, rope_cos: Node, rope_sin: Node
+    ) -> Node:
+        """
+        Create nodes that compute rotary embedding as
+
+            data * cos + rotate_half(data) * sin
+
+        which is one permutation, two multiplies and one add instead of the two channel
+        slices, four multiplies, subtract, add and concatenate of the explicit complex
+        multiply. The result is identical: the permutation weights are exactly +-1 and both
+        forms multiply by the same frequencies, so no rounding differs in bfloat16.
+        """
+        rotate_half = graph.channel_mix(data, self._rope_rotate_half_matrix())
+        return graph.add(graph.mul(data, rope_cos), graph.mul(rotate_half, rope_sin))
 
     def _build_attn_query(
         self,
         graph: ModelGraph,
         base_name: str,
         rms_norm: Node,
-        freq_real: Node,
-        freq_imag: Node,
+        rope_cos: Node,
+        rope_sin: Node,
         merged_lora: bool = False,
     ) -> Node | tuple[Node, Node]:
         lora_rank = None
@@ -207,7 +277,7 @@ class LanguagePreModel(LanguagePartBaseModel):
         if q_norm_name and self.cfg.lm_cfg.arch != LlmArchType.OLMOE:
             reshape1 = graph.rms_norm(q_norm_name, reshape1)
 
-        rotary_emb = self._build_rotary_emb(graph, reshape1, freq_real, freq_imag)
+        rotary_emb = self._build_rotary_emb(graph, reshape1, rope_cos, rope_sin)
 
         if self.cfg.model_type != VlmArchType.VLM_GEMMA4:
             rotary_emb = graph.mul(
@@ -223,8 +293,8 @@ class LanguagePreModel(LanguagePartBaseModel):
         graph: ModelGraph,
         base_name: str,
         rms_norm: Node,
-        freq_real: Node,
-        freq_imag: Node,
+        rope_cos: Node,
+        rope_sin: Node,
         merged_lora: bool = False,
     ) -> Node:
         lora_rank = None
@@ -253,7 +323,7 @@ class LanguagePreModel(LanguagePartBaseModel):
         if k_norm_name and self.cfg.lm_cfg.arch != LlmArchType.OLMOE:
             reshape1 = graph.rms_norm(k_norm_name, reshape1)
 
-        rotary_emb = self._build_rotary_emb(graph, reshape1, freq_real, freq_imag)
+        rotary_emb = self._build_rotary_emb(graph, reshape1, rope_cos, rope_sin)
         return rotary_emb
 
     def _build_attn_value(
