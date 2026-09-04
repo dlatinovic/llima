@@ -227,3 +227,16 @@ __marimo__/
 # Ignore model files
 *.onnx
 *.onnx.ext_data
+
+# JetBrains IDE local state
+.idea/
+
+# Local virtual environments. The stock `venv/` rule above misses prefixed names, and the
+# compiler venv is installed by Model Compiler rather than created here, so these are always
+# somebody's local scratch environment.
+*-venv/
+venv-*/
+
+# Compiler scratch output: retained ONNX, NumPy, MPK and MLA ELF trees. `llima-compile -o`
+# targets are named by the caller, so only the conventional local ones can be listed here.
+gen-tmp/
