@@ -1136,7 +1136,6 @@ class ModelGraph(SimaBuilder):
         self,
         data: NodeOrHandle,
         channel_matrix: np.ndarray,
-        channel_bias: np.ndarray | None = None,
     ) -> NodeOrHandle:
         """Apply a fixed linear map over the channel axis as a 1x1 convolution.
 
@@ -1151,7 +1150,6 @@ class ModelGraph(SimaBuilder):
         Args:
             data: The input node.
             channel_matrix: The map to apply, shaped (input_channels, output_channels).
-            channel_bias: Optional addend, shaped (output_channels,).
         """
         input_type = tensor_type(data)
         input_channels, output_channels = channel_matrix.shape
@@ -1159,10 +1157,6 @@ class ModelGraph(SimaBuilder):
             raise ValueError(
                 f"channel_mix matrix has {input_channels} input channels; "
                 f"the input has {input_type.shape[-1]}"
-            )
-        if channel_bias is not None and channel_bias.shape != (output_channels,):
-            raise ValueError(
-                f"channel_mix bias must have shape ({output_channels},); got {channel_bias.shape}"
             )
 
         # SiMaIR expects weights in HWIGO layout.
@@ -1179,8 +1173,7 @@ class ModelGraph(SimaBuilder):
             batch_size=input_type.shape[0],
             input_type=input_type.scalar,
         )
-        bias = None if channel_bias is None else channel_bias.astype(np.float32)
-        return self.create_conv_node(data, weights, bias, conv_attrs)
+        return self.create_conv_node(data, weights, None, conv_attrs)
 
     def _build_conv_lora(
         self, base_name: str, ifm: NodeOrHandle, lora_shape: tuple[int, int]
