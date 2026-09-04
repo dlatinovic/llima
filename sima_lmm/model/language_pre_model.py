@@ -7,6 +7,7 @@ from sima_lmm.model.base import TensorTessellateParameters, LoraGenMode, LayerCo
 from sima_lmm.model.model_graph import ModelGraph, Node
 from sima_lmm.model.language_part_base import LanguagePartBaseModel
 from sima_lmm.config.vlm_config import LlmArchType, VlmArchType
+from sima_lmm.utils import rope_channel_layout
 
 
 @dataclass
@@ -68,10 +69,19 @@ class LanguagePreModel(LanguagePartBaseModel):
         leaves every other channel unchanged. Partial RoPE rotates a prefix of the head and
         passes the tail through; proportional RoPE (Gemma4 full-attention layers) keeps the
         imaginary half at head_dim // 2, so an unrotated segment sits between the halves.
+
+        The freq_real and freq_imag inputs are head_dim-wide cos and sin tables laid out to
+        match: the producers duplicate each frequency onto both channels of its pair and
+        fill unrotated channels with the neutral cos 1 and sin 0. The producers are
+        sima_lmm.utils.calc_freq_real_imag on the host and rope_utils.cpp
+        calc_freq_real_imag on the DevKit; both derive the layout from rope_channel_layout.
         """
         head_dim = self._head_dim
-        half_rope_dim = self.cfg.lm_cfg.rope_cfg.get_rope_dimension_count(self.layer_type) // 2
-        imag_start = head_dim // 2 if self._is_proportional_rope_layer else half_rope_dim
+        half_rope_dim, imag_start = rope_channel_layout(
+            self.cfg.lm_cfg.rope_cfg.get_rope_dimension_count(self.layer_type),
+            head_dim,
+            self._is_proportional_rope_layer
+        )
         return head_dim, half_rope_dim, imag_start
 
     def _rope_rotate_half_matrix(self) -> np.ndarray:
@@ -79,7 +89,7 @@ class LanguagePreModel(LanguagePartBaseModel):
         Channel map of the rotation's imaginary term, HuggingFace's rotate_half with the
         sign of the real part folded in: output channel i is -data[imag_start + i] and
         output channel imag_start + i is data[i]. Unrotated channels map to zero, which the
-        neutral sin value of _rope_frequency_expansion then discards.
+        neutral sin value of 0 in the uploaded table then discards.
         """
         head_dim, half_rope_dim, imag_start = self._rope_channel_layout
         matrix = np.zeros((head_dim, head_dim), dtype=np.float32)
@@ -87,28 +97,6 @@ class LanguagePreModel(LanguagePartBaseModel):
             matrix[imag_start + i, i] = -1.0
             matrix[i, imag_start + i] = 1.0
         return matrix
-
-    def _rope_frequency_expansion(
-            self, neutral_value: float
-    ) -> tuple[np.ndarray, np.ndarray | None]:
-        """
-        Channel map and bias that widen a frequency table to head_dim channels.
-
-        The runtime uploads cos and sin for rope_dimension_count // 2 channels only, which
-        is the vlm_config.json contract, so each frequency channel has to be duplicated
-        onto both channels of its rotation pair. Unrotated channels take `neutral_value`,
-        1 for cos and 0 for sin, which leaves them unchanged by the rotation.
-        """
-        head_dim, half_rope_dim, imag_start = self._rope_channel_layout
-        matrix = np.zeros((half_rope_dim, head_dim), dtype=np.float32)
-        for i in range(half_rope_dim):
-            matrix[i, i] = 1.0
-            matrix[i, imag_start + i] = 1.0
-
-        bias = np.full(head_dim, neutral_value, dtype=np.float32)
-        bias[:half_rope_dim] = 0.0
-        bias[imag_start:imag_start + half_rope_dim] = 0.0
-        return matrix, bias if bias.any() else None
 
     def generate_graph(
         self,
@@ -119,12 +107,7 @@ class LanguagePreModel(LanguagePartBaseModel):
         merged_lora = layer_cfg.get("lora", LoraGenMode.LORA_DISABLED) == LoraGenMode.LORA_MERGED
         input_shape = (1, 1, self.num_tokens, self._input_hidden_size)
         scale_shape = (1, 1, self.num_tokens, 1)
-        freq_shape = (
-            1,
-            1,
-            self.num_tokens,
-            self.cfg.lm_cfg.rope_cfg.get_rope_dimension_count(self.layer_type) // 2,
-        )
+        freq_shape = (1, 1, self.num_tokens, self._head_dim)
         input_specs = {"input": input_shape}
         input_dtypes = {}
         if self.uses_quantized_input_embeddings and self.layer_idx == 0:
@@ -160,9 +143,7 @@ class LanguagePreModel(LanguagePartBaseModel):
             attn_input = graph.concat([rms_norm, hidden_states_norm], 3)
         else:
             attn_input = rms_norm
-        rope_cos, rope_sin = self._build_rope_frequencies(
-            graph, mla_input_freq_real, mla_input_freq_imag
-        )
+        rope_cos, rope_sin = mla_input_freq_real, mla_input_freq_imag
         mla_q_result = self._build_attn_query(
             graph,
             f"{base_name}.self_attn",
@@ -200,20 +181,6 @@ class LanguagePreModel(LanguagePartBaseModel):
         if gate_out is not None:
             output_nodes.append(gate_out)
         graph.save(output_nodes)
-
-    def _build_rope_frequencies(
-        self, graph: ModelGraph, freq_real: Node, freq_imag: Node
-    ) -> tuple[Node, Node]:
-        """
-        Create nodes that widen the frequency inputs to head_dim-wide cos and sin tables.
-
-        Built once per part and shared by the query and key rotations.
-        """
-        expansion, cos_bias = self._rope_frequency_expansion(1.0)
-        return (
-            graph.channel_mix(freq_real, expansion, cos_bias),
-            graph.channel_mix(freq_imag, expansion),
-        )
 
     def _build_rotary_emb(
         self, graph: ModelGraph, data: Node, rope_cos: Node, rope_sin: Node
