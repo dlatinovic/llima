@@ -112,9 +112,10 @@ def rope_channel_layout(
     at head_dim // 2, so an unrotated segment sits between the halves.
 
     The frequency tables the language pre models consume are laid out to match: each
-    frequency appears on both channels of its pair, and unrotated channels hold the neutral
-    rotation of cos 1 and sin 0. This is the compiler side of that contract; the runtime
-    builds the same layout in rope_utils.cpp rope_channel_layout.
+    frequency appears on both channels of its pair, with the sin of the real channel i negated,
+    and unrotated channels hold the neutral rotation of cos 1 and sin 0. This is the compiler
+    side of that contract; the runtime builds the same layout in rope_utils.cpp
+    rope_channel_layout.
     """
     half_rope_dim = rope_dimension_count // 2
     imag_start = head_dim // 2 if proportional else half_rope_dim
@@ -239,12 +240,15 @@ def calc_freq_real_imag(
     cos = np.cos(angles) * np.float32(attention_factor)
     sin = np.sin(angles) * np.float32(attention_factor)
 
-    # Each frequency lands on both channels of its rotation pair. Channels the rotation does
-    # not reach keep the neutral rotation of cos 1 and sin 0: the tail of a partial rotation,
-    # the middle segment of a proportional one, and any frequency that the scaling dropped.
+    # Each frequency lands on both channels of its rotation pair. The pre model multiplies sin
+    # by a pure channel swap of the data, so the sin of the real channel carries the minus
+    # sign of the rotation: out[i] = x[i] * cos - x[imag_start + i] * sin. Channels the
+    # rotation does not reach keep the neutral rotation of cos 1 and sin 0: the tail of a
+    # partial rotation, the middle segment of a proportional one, and any frequency that the
+    # scaling dropped.
     re = np.ones((1, 1, max_num_tokens, head_dim), dtype=np.float32)
     im = np.zeros((1, 1, max_num_tokens, head_dim), dtype=np.float32)
-    for start in (0, imag_start):
+    for start, sign in ((0, -1), (imag_start, 1)):
         re[..., start:start + n_scaled_freq] = cos
-        im[..., start:start + n_scaled_freq] = sin
+        im[..., start:start + n_scaled_freq] = sign * sin
     return re, im
