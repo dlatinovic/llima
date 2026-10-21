@@ -77,9 +77,10 @@ static Eigen::ArrayXf calc_rope_scaling_longrope(
 // layer_head_dim / 2, so an unrotated segment sits between the halves.
 //
 // The frequency tables the language pre models consume are laid out to match: each frequency
-// appears on both channels of its pair, and unrotated channels hold the neutral rotation of
-// cos 1 and sin 0. This is the runtime side of that contract; the compiler builds the same
-// layout in sima_lmm/utils.py rope_channel_layout and consumes it in language_pre_model.py.
+// appears on both channels of its pair, with the sin of the real channel i negated, and
+// unrotated channels hold the neutral rotation of cos 1 and sin 0. This is the runtime side of
+// that contract; the compiler builds the same layout in sima_lmm/utils.py rope_channel_layout
+// and consumes it in language_pre_model.py.
 static std::pair<uint16_t, uint16_t> rope_channel_layout(
     uint16_t rope_dimension_count, uint16_t layer_head_dim, bool proportional
 ) {
@@ -198,14 +199,19 @@ RopeTable calc_freq_real_imag(
         im_float *= yarn_attention_factor;
     }
 
-    // Each frequency lands on both channels of its rotation pair. Channels the rotation does
-    // not reach keep the neutral rotation of cos 1 and sin 0: the tail of a partial rotation,
-    // the middle segment of a proportional one, and any frequency the scaling dropped.
+    // Each frequency lands on both channels of its rotation pair. The pre model multiplies sin
+    // by a pure channel swap of the data, so the sin of the real channel carries the minus sign
+    // of the rotation: out[i] = x[i] * cos - x[imag_start + i] * sin. Channels the rotation
+    // does not reach keep the neutral rotation of cos 1 and sin 0: the tail of a partial
+    // rotation, the middle segment of a proportional one, and any frequency the scaling dropped.
     MatrixXXbf re = MatrixXXbf::Ones(max_num_tokens, layer_head_dim);
     MatrixXXbf im = MatrixXXbf::Zero(max_num_tokens, layer_head_dim);
     for (const uint16_t start : {uint16_t(0), imag_start}) {
+        const float sign = start == 0 ? -1.0f : 1.0f;
         re.block(0, start, max_num_tokens, num_scaled_freq) = re_float.cast<Eigen::bfloat16>();
-        im.block(0, start, max_num_tokens, num_scaled_freq) = im_float.cast<Eigen::bfloat16>();
+        im.block(0, start, max_num_tokens, num_scaled_freq) = (
+            (sign * im_float).cast<Eigen::bfloat16>()
+        );
     }
 
     std::vector<Eigen::bfloat16> re_vec(static_cast<size_t>(max_num_tokens) * layer_head_dim);

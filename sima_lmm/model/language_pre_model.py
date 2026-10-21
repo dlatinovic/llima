@@ -71,8 +71,9 @@ class LanguagePreModel(LanguagePartBaseModel):
         imaginary half at head_dim // 2, so an unrotated segment sits between the halves.
 
         The freq_real and freq_imag inputs are head_dim-wide cos and sin tables laid out to
-        match: the producers duplicate each frequency onto both channels of its pair and
-        fill unrotated channels with the neutral cos 1 and sin 0. The producers are
+        match: the producers duplicate each frequency onto both channels of its pair, negate
+        the sin of the real channel i, and fill unrotated channels with the neutral cos 1 and
+        sin 0. The producers are
         sima_lmm.utils.calc_freq_real_imag on the host and rope_utils.cpp
         calc_freq_real_imag on the DevKit; both derive the layout from rope_channel_layout.
         """
@@ -86,16 +87,20 @@ class LanguagePreModel(LanguagePartBaseModel):
 
     def _rope_rotate_half_matrix(self) -> np.ndarray:
         """
-        Channel map of the rotation's imaginary term, HuggingFace's rotate_half with the
-        sign of the real part folded in: output channel i is -data[imag_start + i] and
-        output channel imag_start + i is data[i]. Unrotated channels map to zero, which the
-        neutral sin value of 0 in the uploaded table then discards.
+        Channel map of the rotation's imaginary term, HuggingFace's rotate_half without its
+        sign: output channel i is data[imag_start + i], output channel imag_start + i is
+        data[i], and every unrotated channel maps to itself, where the neutral sin of 0 in
+        the uploaded table discards it. The minus sign of the rotation lives in the sin table.
+
+        The map is a pure 0/1 channel permutation, which the MLA can execute as whole channel
+        block moves when half_rope_dim and imag_start are multiples of the 16-channel row.
         """
         head_dim, half_rope_dim, imag_start = self._rope_channel_layout
+        perm = np.arange(head_dim)
+        perm[:half_rope_dim] = np.arange(imag_start, imag_start + half_rope_dim)
+        perm[imag_start:imag_start + half_rope_dim] = np.arange(half_rope_dim)
         matrix = np.zeros((head_dim, head_dim), dtype=np.float32)
-        for i in range(half_rope_dim):
-            matrix[imag_start + i, i] = -1.0
-            matrix[i, imag_start + i] = 1.0
+        matrix[perm, np.arange(head_dim)] = 1.0
         return matrix
 
     def generate_graph(
@@ -192,8 +197,9 @@ class LanguagePreModel(LanguagePartBaseModel):
 
         which is one permutation, two multiplies and one add instead of the two channel
         slices, four multiplies, subtract, add and concatenate of the explicit complex
-        multiply. The result is identical: the permutation weights are exactly +-1 and both
-        forms multiply by the same frequencies, so no rounding differs in bfloat16.
+        multiply. The result is identical: the permutation only moves channels, the sin table
+        carries the rotation's sign, and negation is exact, so both forms round the same
+        products in bfloat16.
         """
         rotate_half = graph.channel_mix(data, self._rope_rotate_half_matrix())
         return graph.add(graph.mul(data, rope_cos), graph.mul(rotate_half, rope_sin))
