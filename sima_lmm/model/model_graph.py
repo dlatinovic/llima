@@ -1,6 +1,5 @@
 """Common native graph operations with model weights and precision bound once."""
 
-import dataclasses
 import math
 from dataclasses import replace
 from typing import Callable, Sequence, TypedDict, Unpack
@@ -1176,7 +1175,7 @@ class ModelGraph(SimaBuilder):
         node = self.create_conv_node(data, weights, None, conv_attrs)
         # Quantization merges the global configuration only into fields left unassigned, so
         # this per-node precision survives it.
-        node.ir.quant_config = dataclasses.replace(
+        node.ir.quant_config = replace(
             node.ir.quant_config,
             quantization_precision=Opt(QuantizationPrecision.BFLOAT_16),
         )
