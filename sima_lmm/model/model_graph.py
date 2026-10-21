@@ -1,5 +1,6 @@
 """Common native graph operations with model weights and precision bound once."""
 
+import dataclasses
 import math
 from dataclasses import replace
 from typing import Callable, Sequence, TypedDict, Unpack
@@ -7,6 +8,7 @@ from typing import Callable, Sequence, TypedDict, Unpack
 import numpy as np
 from afe.apis.defines import gen2_target
 from afe.backends.backends import Backend
+from afe.core.configs import Opt, QuantizationPrecision
 from afe.ir.attributes import ClipAttrs, ConvAttrs, ReluAttrs
 from afe.ir.build_node import NodeOrHandle, TopKRetType, as_handle
 from afe.ir.defines import Status, get_expected_tensor_value
@@ -1139,13 +1141,11 @@ class ModelGraph(SimaBuilder):
     ) -> NodeOrHandle:
         """Apply a fixed linear map over the channel axis as a 1x1 convolution.
 
-        A channel permutation cannot be expressed with a slice and a concatenate on the MLA:
-        the N2A converter re-derives in-order splits from a slice-concat, so an out-of-order
-        channel arrangement is lost. TVM canonicalization solves this by rewriting such a
-        pattern into a 1x1 convolution (ChannelReverseSliceConcatToConv); this builds the same
-        thing directly. A matrix that only selects or negates whole channels stays exact in
-        every supported precision, because per-channel weight quantization of a single +-1
-        value is lossless.
+        The convolution's weights stay bfloat16 in every precision. A map that only selects or
+        negates channels has nothing to gain from integer weights, and an integer filter under
+        bfloat16 activations quantizes the activations to int8 per token, which makes a
+        permutation lossy. With bfloat16 weights a 0/1 permutation is an exact copy, which N2A
+        compiles as a channel permute when it moves whole 16-channel blocks.
 
         Args:
             data: The input node.
@@ -1173,7 +1173,14 @@ class ModelGraph(SimaBuilder):
             batch_size=input_type.shape[0],
             input_type=input_type.scalar,
         )
-        return self.create_conv_node(data, weights, None, conv_attrs)
+        node = self.create_conv_node(data, weights, None, conv_attrs)
+        # Quantization merges the global configuration only into fields left unassigned, so
+        # this per-node precision survives it.
+        node.ir.quant_config = dataclasses.replace(
+            node.ir.quant_config,
+            quantization_precision=Opt(QuantizationPrecision.BFLOAT_16),
+        )
+        return node
 
     def _build_conv_lora(
         self, base_name: str, ifm: NodeOrHandle, lora_shape: tuple[int, int]
