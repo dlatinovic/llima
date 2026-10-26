@@ -85,23 +85,21 @@ class LanguagePreModel(LanguagePartBaseModel):
         )
         return head_dim, half_rope_dim, imag_start
 
-    def _rope_rotate_half_matrix(self) -> np.ndarray:
+    def _rope_rotate_half_perm(self) -> list[int]:
         """
-        Channel map of the rotation's imaginary term, HuggingFace's rotate_half without its
-        sign: output channel i is data[imag_start + i], output channel imag_start + i is
+        Channel permutation of the rotation's imaginary term, HuggingFace's rotate_half without
+        its sign: output channel i is data[imag_start + i], output channel imag_start + i is
         data[i], and every unrotated channel maps to itself, where the neutral sin of 0 in
         the uploaded table discards it. The minus sign of the rotation lives in the sin table.
 
-        The map is a pure 0/1 channel permutation, which the MLA can execute as whole channel
-        block moves when half_rope_dim and imag_start are multiples of the 16-channel row.
+        The MLA executes the permutation as whole channel block moves when half_rope_dim and
+        imag_start are multiples of the 16-channel row.
         """
         head_dim, half_rope_dim, imag_start = self._rope_channel_layout
-        perm = np.arange(head_dim)
-        perm[:half_rope_dim] = np.arange(imag_start, imag_start + half_rope_dim)
-        perm[imag_start:imag_start + half_rope_dim] = np.arange(half_rope_dim)
-        matrix = np.zeros((head_dim, head_dim), dtype=np.float32)
-        matrix[perm, np.arange(head_dim)] = 1.0
-        return matrix
+        perm = list(range(head_dim))
+        perm[:half_rope_dim] = range(imag_start, imag_start + half_rope_dim)
+        perm[imag_start:imag_start + half_rope_dim] = range(half_rope_dim)
+        return perm
 
     def generate_graph(
         self,
@@ -201,7 +199,7 @@ class LanguagePreModel(LanguagePartBaseModel):
         carries the rotation's sign, and negation is exact, so both forms round the same
         products in bfloat16.
         """
-        rotate_half = graph.channel_mix(data, self._rope_rotate_half_matrix())
+        rotate_half = graph.channel_permute(data, self._rope_rotate_half_perm())
         return graph.add(graph.mul(data, rope_cos), graph.mul(rotate_half, rope_sin))
 
     def _build_attn_query(

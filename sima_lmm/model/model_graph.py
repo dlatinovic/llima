@@ -25,6 +25,10 @@ from sima_lmm.utils import ceil_div_row, mla_max_num_rows, mla_row_size, round_u
 _bfloat16 = ScalarType.numpy_type(ScalarType.bfloat16)
 Node = NodeOrHandle
 
+# Whether the installed SDK provides ChannelPermuteOp. It decides how ModelGraph.channel_permute
+# is lowered; the SDK pinned in deps/manifest.json determines the value.
+SDK_HAS_CHANNEL_PERMUTE = hasattr(SimaBuilder, "create_channel_permute_node")
+
 
 def activation_type(quantizable: bool) -> ScalarType:
     """
@@ -1180,6 +1184,28 @@ class ModelGraph(SimaBuilder):
             quantization_precision=Opt(QuantizationPrecision.BFLOAT_16),
         )
         return node
+
+    def channel_permute(self, data: NodeOrHandle, perm: Sequence[int]) -> NodeOrHandle:
+        """Reorder the channel axis: output channel j is input channel perm[j].
+
+        With an SDK that provides ChannelPermuteOp (SDK_HAS_CHANNEL_PERMUTE), the permutation is
+        a data-movement node that keeps the input's type and quantization. With an older SDK it
+        is channel_mix with the permutation's 0/1 matrix. N2A compiles both as whole 16-channel
+        block moves when the permutation allows it.
+
+        Args:
+            data: The input node.
+            perm: A permutation of range(C), where C is the input's channel count.
+        """
+        if SDK_HAS_CHANNEL_PERMUTE:
+            return self.create_channel_permute_node(data, perm)
+
+        channels = tensor_type(data).shape[-1]
+        if sorted(perm) != list(range(channels)):
+            raise ValueError(f"Channel permutation must reorder range({channels}); got {list(perm)}")
+        matrix = np.zeros((channels, channels), dtype=np.float32)
+        matrix[list(perm), np.arange(channels)] = 1.0
+        return self.channel_mix(data, matrix)
 
     def _build_conv_lora(
         self, base_name: str, ifm: NodeOrHandle, lora_shape: tuple[int, int]
