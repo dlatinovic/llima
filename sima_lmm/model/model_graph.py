@@ -1163,7 +1163,9 @@ class ModelGraph(SimaBuilder):
             )
 
         # SiMaIR expects weights in HWIGO layout.
-        weights = channel_matrix.astype(np.float32).reshape(1, 1, input_channels, 1, output_channels)
+        weights = channel_matrix.astype(np.float32).reshape(
+            1, 1, input_channels, 1, output_channels
+        )
         conv_attrs = ConvAttrs(
             stride=(1, 1),
             dilation=(1, 1),
@@ -1202,7 +1204,9 @@ class ModelGraph(SimaBuilder):
 
         channels = tensor_type(data).shape[-1]
         if sorted(perm) != list(range(channels)):
-            raise ValueError(f"Channel permutation must reorder range({channels}); got {list(perm)}")
+            raise ValueError(
+                f"Channel permutation must reorder range({channels}); got {list(perm)}"
+            )
         matrix = np.zeros((channels, channels), dtype=np.float32)
         matrix[list(perm), np.arange(channels)] = 1.0
         return self.channel_mix(data, matrix)
