@@ -232,19 +232,6 @@ def test_slice_keeps_integer_channels_on_native_path(quantizable):
 
 @pytest.mark.parametrize("quantizable", [True, False])
 @pytest.mark.parametrize(
-    "sdk_has_channel_permute,operator",
-    [
-        pytest.param(
-            True, "ChannelPermuteOp",
-            marks=pytest.mark.skipif(
-                not hasattr(SimaBuilder, "create_channel_permute_node"),
-                reason="The installed SDK has no ChannelPermuteOp",
-            ),
-        ),
-        (False, "ConvAddActivationOp"),
-    ],
-)
-@pytest.mark.parametrize(
     "perm",
     [
         list(range(32, 64)) + list(range(32)),
@@ -252,16 +239,11 @@ def test_slice_keeps_integer_channels_on_native_path(quantizable):
     ],
     ids=["rotate_half", "unaligned"],
 )
-def test_channel_permute_reorders_channels(
-    monkeypatch, quantizable, sdk_has_channel_permute, operator, perm
-):
-    monkeypatch.setattr(
-        "sima_lmm.model.model_graph.SDK_HAS_CHANNEL_PERMUTE", sdk_has_channel_permute
-    )
+def test_channel_permute_reorders_channels(quantizable, perm):
     shape = (1, 1, 3, 64)
     graph = ModelGraph(_source(), {"x": shape}, quantizable)
     output = graph.channel_permute(graph.inputs["x"], perm)
-    assert type(output.ir.operation).__name__ == operator
+    assert type(output.ir.operation).__name__ == "ChannelPermuteOp"
     x = np.arange(np.prod(shape)).reshape(shape).astype(activation_dtype(quantizable))
     execute = (
         create_node_executor(False) if quantizable else create_node_quant_executor(False, False)
@@ -270,11 +252,17 @@ def test_channel_permute_reorders_channels(
     np.testing.assert_array_equal(actual, x[..., perm].astype(np.float32))
 
 
-def test_channel_permute_rejects_non_permutation(monkeypatch):
-    monkeypatch.setattr("sima_lmm.model.model_graph.SDK_HAS_CHANNEL_PERMUTE", False)
+def test_channel_permute_rejects_non_permutation():
     graph = ModelGraph(_source(), {"x": (1, 1, 2, 4)}, True)
     with pytest.raises(ValueError, match="must reorder range"):
         graph.channel_permute(graph.inputs["x"], [0, 1, 1, 3])
+
+
+def test_channel_permute_requires_sdk_channel_permute_op(monkeypatch):
+    monkeypatch.delattr(SimaBuilder, "create_channel_permute_node", raising=False)
+    graph = ModelGraph(_source(), {"x": (1, 1, 2, 4)}, True)
+    with pytest.raises(RuntimeError, match="ChannelPermuteOp"):
+        graph.channel_permute(graph.inputs["x"], [1, 0, 3, 2])
 
 
 def test_model_graph_requires_an_output():

@@ -7,7 +7,6 @@ from typing import Callable, Sequence, TypedDict, Unpack
 import numpy as np
 from afe.apis.defines import gen2_target
 from afe.backends.backends import Backend
-from afe.core.configs import Opt, QuantizationPrecision
 from afe.ir.attributes import ClipAttrs, ConvAttrs, ReluAttrs
 from afe.ir.build_node import NodeOrHandle, TopKRetType, as_handle
 from afe.ir.defines import Status, get_expected_tensor_value
@@ -24,11 +23,6 @@ from sima_lmm.utils import ceil_div_row, mla_max_num_rows, mla_row_size, round_u
 
 _bfloat16 = ScalarType.numpy_type(ScalarType.bfloat16)
 Node = NodeOrHandle
-
-# Whether the installed SDK provides ChannelPermuteOp. It decides how ModelGraph.channel_permute
-# is lowered; the SDK pinned in deps/manifest.json determines the value.
-SDK_HAS_CHANNEL_PERMUTE = hasattr(SimaBuilder, "create_channel_permute_node")
-
 
 def activation_type(quantizable: bool) -> ScalarType:
     """
@@ -1137,79 +1131,29 @@ class ModelGraph(SimaBuilder):
         )
         return self.create_conv_node(input_node, weights, None, conv_attrs)
 
-    def channel_mix(
-        self,
-        data: NodeOrHandle,
-        channel_matrix: np.ndarray,
-    ) -> NodeOrHandle:
-        """Apply a fixed linear map over the channel axis as a 1x1 convolution.
-
-        The convolution's weights stay bfloat16 in every precision. A map that only selects or
-        negates channels has nothing to gain from integer weights, and an integer filter under
-        bfloat16 activations quantizes the activations to int8 per token, which makes a
-        permutation lossy. With bfloat16 weights a 0/1 permutation is an exact copy, which N2A
-        compiles as a channel permute when it moves whole 16-channel blocks.
-
-        Args:
-            data: The input node.
-            channel_matrix: The map to apply, shaped (input_channels, output_channels).
-        """
-        input_type = tensor_type(data)
-        input_channels, output_channels = channel_matrix.shape
-        if input_channels != input_type.shape[-1]:
-            raise ValueError(
-                f"channel_mix matrix has {input_channels} input channels; "
-                f"the input has {input_type.shape[-1]}"
-            )
-
-        # SiMaIR expects weights in HWIGO layout.
-        weights = channel_matrix.astype(np.float32).reshape(
-            1, 1, input_channels, 1, output_channels
-        )
-        conv_attrs = ConvAttrs(
-            stride=(1, 1),
-            dilation=(1, 1),
-            padding=((0, 0), (0, 0)),
-            output_padding=((0, 0), (0, 0)),
-            is_transposed=False,
-            weight_shape=weights.shape,
-            reloc_name=None,
-            input_spatial_shape=input_type.shape[1:-1],
-            batch_size=input_type.shape[0],
-            input_type=input_type.scalar,
-        )
-        node = self.create_conv_node(data, weights, None, conv_attrs)
-        # Quantization merges the global configuration only into fields left unassigned, so
-        # this per-node precision survives it.
-        node.ir.quant_config = replace(
-            node.ir.quant_config,
-            quantization_precision=Opt(QuantizationPrecision.BFLOAT_16),
-        )
-        return node
-
     def channel_permute(self, data: NodeOrHandle, perm: Sequence[int]) -> NodeOrHandle:
         """Reorder the channel axis: output channel j is input channel perm[j].
 
-        With an SDK that provides ChannelPermuteOp (SDK_HAS_CHANNEL_PERMUTE), the permutation is
-        a data-movement node that keeps the input's type and quantization. With an older SDK it
-        is channel_mix with the permutation's 0/1 matrix. N2A compiles both as whole 16-channel
-        block moves when the permutation allows it.
+        The permutation is a ChannelPermuteOp, a data-movement node that keeps the input's type
+        and quantization. N2A compiles it as whole 16-channel block moves when the permutation
+        allows it.
 
         Args:
             data: The input node.
             perm: A permutation of range(C), where C is the input's channel count.
         """
-        if SDK_HAS_CHANNEL_PERMUTE:
-            return self.create_channel_permute_node(data, perm)
-
+        if not hasattr(self, "create_channel_permute_node"):
+            raise RuntimeError(
+                "LLiMa needs a Model SDK that provides ChannelPermuteOp "
+                "(SimaBuilder.create_channel_permute_node); install the SDK version "
+                "pinned in deps/manifest.json"
+            )
         channels = tensor_type(data).shape[-1]
         if sorted(perm) != list(range(channels)):
             raise ValueError(
                 f"Channel permutation must reorder range({channels}); got {list(perm)}"
             )
-        matrix = np.zeros((channels, channels), dtype=np.float32)
-        matrix[list(perm), np.arange(channels)] = 1.0
-        return self.channel_mix(data, matrix)
+        return self.create_channel_permute_node(data, perm)
 
     def _build_conv_lora(
         self, base_name: str, ifm: NodeOrHandle, lora_shape: tuple[int, int]

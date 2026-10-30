@@ -193,11 +193,9 @@ class LanguagePreModel(LanguagePartBaseModel):
 
             data * cos + rotate_half(data) * sin
 
-        which is one permutation, two multiplies and one add instead of the two channel
-        slices, four multiplies, subtract, add and concatenate of the explicit complex
-        multiply. The result is identical: the permutation only moves channels, the sin table
-        carries the rotation's sign, and negation is exact, so both forms round the same
-        products in bfloat16.
+        This equals the complex multiply of each (real, imaginary) channel pair by
+        (cos + i sin) exactly: the permutation only moves channels, the sin table carries the
+        rotation's sign, and negation is exact, so both round the same products in bfloat16.
         """
         rotate_half = graph.channel_permute(data, self._rope_rotate_half_perm())
         return graph.add(graph.mul(data, rope_cos), graph.mul(rotate_half, rope_sin))
